@@ -1,0 +1,19 @@
+{
+  "name": "wps-serve",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "npm -w @wps/doc-service run dev",
+    "build": "npm -ws run build",
+    "typecheck": "npm -ws run typecheck",
+    "test": "npm -ws run test"
+  }
+}
+
