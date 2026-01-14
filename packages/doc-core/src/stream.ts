@@ -136,3 +136,58 @@ export async function pipeAsyncIterableToResponseAsNdjson(
     res.off("close", abort)
   }
 }
+
+/**
+ * 按照分帧协议推送完整的 docx 块
+ * 每个块格式：[4字节长度][完整docx]
+ * 结束标记：[4字节0]
+ */
+export async function pipeDocxChunksToResponse(
+  req: IncomingMessage,
+  res: ServerResponse,
+  docxChunks: AsyncIterable<Buffer>,
+  options?: { delayMs?: number }
+): Promise<void> {
+  const delayMs = Math.max(0, Math.min(options?.delayMs ?? 0, 60_000))
+
+  let aborted = false
+  const abort = () => {
+    aborted = true
+  }
+
+  req.on("aborted", abort)
+  res.on("close", abort)
+
+  try {
+    let didWriteAny = false
+    for await (const docxBuffer of docxChunks) {
+      if (aborted) break
+
+      if (didWriteAny && delayMs > 0) {
+        await sleep(delayMs)
+      }
+
+      // 写入 4 字节长度头（大端序）
+      const lengthHeader = Buffer.alloc(4)
+      lengthHeader.writeUInt32BE(docxBuffer.length, 0)
+      
+      if (!res.write(lengthHeader)) {
+        await once(res, "drain")
+      }
+
+      // 写入完整的 docx 数据
+      if (!res.write(docxBuffer)) {
+        await once(res, "drain")
+      }
+
+      didWriteAny = true
+    }
+
+    // 写入结束标记（长度为 0）
+    const endMarker = Buffer.alloc(4)
+    res.end(endMarker)
+  } finally {
+    req.off("aborted", abort)
+    res.off("close", abort)
+  }
+}

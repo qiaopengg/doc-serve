@@ -1,7 +1,8 @@
 import type { Router } from "../http/router.js"
 import type { DocStore } from "../docStore/types.js"
-import { HttpError, pipeAsyncIterableToResponseAsNdjson, pipeReadableToResponse, pipeReadableToResponseAsFramedChunks } from "@wps/doc-core"
+import { HttpError, pipeAsyncIterableToResponseAsNdjson, pipeReadableToResponse, pipeReadableToResponseAsFramedChunks, pipeDocxChunksToResponse } from "@wps/doc-core"
 import { URL } from "node:url"
+import { extractParagraphsFromDocx, createDocxFromParagraphs } from "../docStore/docxGenerator.js"
 
 const DEFAULT_DOC_ID = "test.docx"
 
@@ -166,6 +167,36 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     res.statusCode = 200
     if (typeof res.flushHeaders === "function") res.flushHeaders()
     await pipeReadableToResponseAsFramedChunks(req, res, stream, { chunkSize, delayMs })
+  })
+
+  // 新接口：按完整 docx 块流式推送
+  router.add("GET", "/api/v1/docs/stream-docx", async ({ req, res }) => {
+    const delayMs = randomIntInclusive(100, 200)
+    
+    res.statusCode = 200
+    res.setHeader("Content-Type", "application/x-wps-docx-chunks")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.setHeader("Cache-Control", "no-store")
+    res.setHeader("X-WPS-Stream-Mode", "docx-chunks")
+    res.setHeader("X-WPS-Delay-Ms", String(delayMs))
+    
+    if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
+    if (typeof res.flushHeaders === "function") res.flushHeaders()
+
+    // 生成器：逐段落生成完整 docx
+    async function* generateDocxChunks(): AsyncGenerator<Buffer> {
+      // 提取段落（实际项目中从真实文档提取）
+      const allParagraphs = await extractParagraphsFromDocx(Buffer.alloc(0))
+      
+      // 逐个段落生成完整 docx
+      for (let i = 0; i < allParagraphs.length; i++) {
+        const paragraphsUpToNow = allParagraphs.slice(0, i + 1)
+        const docxBuffer = await createDocxFromParagraphs(paragraphsUpToNow)
+        yield docxBuffer
+      }
+    }
+
+    await pipeDocxChunksToResponse(req, res, generateDocxChunks(), { delayMs })
   })
 
   router.add("GET", "/api/v1/docs/:docId/download", async ({ req, res, params }) => {

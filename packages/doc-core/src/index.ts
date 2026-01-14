@@ -4,5 +4,6 @@ export {
   pipeReadableToResponse,
   pipeReadableToResponseAsFramedChunks,
   pipeReadableToResponseInChunks,
-  pipeAsyncIterableToResponseAsNdjson
+  pipeAsyncIterableToResponseAsNdjson,
+  pipeDocxChunksToResponse
 } from "./stream.js"
