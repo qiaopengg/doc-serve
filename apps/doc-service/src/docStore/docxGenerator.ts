@@ -45,18 +45,6 @@ export interface DocxParagraph {
  * ⚠️ 本函数数据完全基于 Python XML 解析器从 text.docx 提取的真实样式
  * 解析工具：parse-docx-complete.py
  * 数据来源：text-docx-complete.json
- * 
- * 真实样式特征（与之前理解不同）：
- * - 主标题：fontSize:36, bold:true, italic:false（只粗体，无斜体）
- * - 副标题：fontSize:22, bold:false, italic:false, color:C0C0C0（灰色普通文本）
- * - 章节标题：fontSize:26, bold:true, italic:false（只粗体）
- * - 正文：fontSize:22, bold:false, italic:false（普通文本）
- * - 表格标题：fontSize:22, bold:true, italic:true, fill:808080（粗体+斜体）⚠️
- * - 表格表头：fontSize:20, bold:true, italic:true, fill:808080（粗体+斜体）⚠️
- * - 表格数据：fontSize:20, bold:true, italic:true（粗体+斜体）⚠️
- * - 特殊单元格4：fontSize:44, bold:true, italic:true, font:Lantinghei TC Demibold
- * 
- * ⚠️ 注意：表格中的所有文本都使用粗体+斜体，这与正文段落不同！
  */
 export async function extractParagraphsFromDocx(_docxBuffer: Buffer): Promise<DocxParagraph[]> {
   return [

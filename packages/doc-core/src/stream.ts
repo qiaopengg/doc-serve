@@ -24,38 +24,6 @@ export async function pipeReadableToResponse(
   }
 }
 
-export async function pipeReadableToResponseInChunks(
-  req: IncomingMessage,
-  res: ServerResponse,
-  readable: Readable,
-  options?: { chunkSize?: number }
-): Promise<void> {
-  const chunkSize = Math.max(1024, Math.min(options?.chunkSize ?? 64 * 1024, 1024 * 1024))
-
-  const abort = () => {
-    readable.destroy()
-  }
-
-  req.on("aborted", abort)
-  res.on("close", abort)
-
-  try {
-    for await (const chunk of readable) {
-      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
-      for (let offset = 0; offset < buf.length; offset += chunkSize) {
-        const piece = buf.subarray(offset, Math.min(offset + chunkSize, buf.length))
-        if (!res.write(piece)) {
-          await once(res, "drain")
-        }
-      }
-    }
-    res.end()
-  } finally {
-    req.off("aborted", abort)
-    res.off("close", abort)
-  }
-}
-
 export async function pipeReadableToResponseAsFramedChunks(
   req: IncomingMessage,
   res: ServerResponse,
