@@ -1,8 +1,7 @@
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, AlignmentType, UnderlineType, IRunOptions, PageOrientation } from "docx"
-import { XMLBuilder, XMLParser } from "fast-xml-parser"
-import { createRequire } from "node:module"
-import type { Readable } from "node:stream"
-import type { Entry, ZipFile } from "yauzl"
+import { XMLParser } from "fast-xml-parser"
+import { readZipEntry, replaceZipEntry } from "./core/zipReader.js"
+import { parseXml, buildXml } from "./core/xmlParser.js"
 
 export type BorderSpec = {
   style?: string
@@ -207,6 +206,7 @@ export interface DocxParagraph {
   tableLayout?: "fixed" | "autofit"
   tableGridCols?: number[]
   tableBorders?: TableBordersSpec
+  tableStyleId?: string  // 表格样式引用
   link?: string
   runs?: RunStyle[]  // 支持多个 run（用于处理混合样式段落）
   sectionProperties?: SectionPropertiesSpec
@@ -258,8 +258,10 @@ function normalizeColor(v: unknown): string | undefined {
   const s = String(v).trim()
   if (!s || s.toLowerCase() === "auto") return undefined
   const hex = s.replace(/^#/, "").toUpperCase()
-  if (!/^[0-9A-F]{6}$/.test(hex)) return undefined
-  return hex
+  // 支持 6 位和 8 位十六进制颜色
+  if (/^[0-9A-F]{6}$/.test(hex)) return hex
+  if (/^[0-9A-F]{8}$/.test(hex)) return hex.substring(0, 6) // 去掉 alpha 通道
+  return undefined
 }
 
 function normalizeBorderColor(v: unknown): string | undefined {
@@ -787,8 +789,7 @@ function parseMathNodes(pNode: OrderedXmlNode): MathSpec[] {
   for (const c of childrenOf(pNode)) {
     if (tagNameOf(c) === "m:oMath" || tagNameOf(c) === "m:oMathPara") {
       // 简化：保存原始 XML
-      const builder = new XMLBuilder({ ignoreAttributes: false, preserveOrder: true, format: false })
-      const omml = builder.build([c])
+      const omml = buildXml([c], { ignoreAttributes: false, preserveOrder: true, format: false })
       maths.push({ type: "math", omml })
     }
   }
@@ -805,49 +806,6 @@ function resolveStyleChain(styleId: string | undefined, styles: StyleMap, kind: 
   const base = resolveStyleChain(s.basedOn, styles, kind, visited)
   const own = kind === "run" ? (s.run ?? {}) : (s.para ?? {})
   return mergeDefined(base, own)
-}
-
-async function readZipEntry(docxBuffer: Buffer, entryName: string): Promise<Buffer | undefined> {
-  const require = createRequire(import.meta.url)
-  const yauzl = require("yauzl") as typeof import("yauzl")
-
-  return await new Promise((resolve, reject) => {
-    yauzl.fromBuffer(docxBuffer, { lazyEntries: true }, (err: Error | null, zipfile?: ZipFile) => {
-      if (err || !zipfile) {
-        reject(err ?? new Error("zip_open_failed"))
-        return
-      }
-
-      let done = false
-
-      const finish = (result: Buffer | undefined) => {
-        if (done) return
-        done = true
-        zipfile.close()
-        resolve(result)
-      }
-
-      zipfile.readEntry()
-      zipfile.on("entry", (entry: Entry) => {
-        if (entry.fileName !== entryName) {
-          zipfile.readEntry()
-          return
-        }
-        zipfile.openReadStream(entry, (err2: Error | null, stream?: Readable) => {
-          if (err2 || !stream) {
-            reject(err2 ?? new Error("zip_entry_stream_failed"))
-            return
-          }
-          const chunks: Buffer[] = []
-          stream.on("data", (c: Buffer) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
-          stream.on("end", () => finish(Buffer.concat(chunks)))
-          stream.on("error", reject)
-        })
-      })
-      zipfile.on("end", () => finish(undefined))
-      zipfile.on("error", reject)
-    })
-  })
 }
 
 // 解析 numbering.xml 获取编号格式定义
@@ -899,61 +857,6 @@ function parseNumbering(xml: string): Map<string, Map<number, { format?: string;
   }
   
   return result
-}
-
-async function readAllReadable(stream: Readable): Promise<Buffer> {
-  const chunks: Buffer[] = []
-  for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
-  return Buffer.concat(chunks)
-}
-
-async function replaceZipEntry(docxBuffer: Buffer, entryName: string, replacement: Buffer): Promise<Buffer> {
-  const require = createRequire(import.meta.url)
-  const yauzl = require("yauzl") as typeof import("yauzl")
-  const yazl = require("yazl") as typeof import("yazl")
-
-  const zipOut = new yazl.ZipFile()
-  const outPromise = readAllReadable(zipOut.outputStream as unknown as Readable)
-
-  await new Promise<void>((resolve, reject) => {
-    yauzl.fromBuffer(docxBuffer, { lazyEntries: true }, (err: Error | null, zipfile?: ZipFile) => {
-      if (err || !zipfile) {
-        reject(err ?? new Error("zip_open_failed"))
-        return
-      }
-
-      zipfile.readEntry()
-      zipfile.on("entry", (entry: Entry) => {
-        if (entry.fileName.endsWith("/")) {
-          zipOut.addEmptyDirectory(entry.fileName)
-          zipfile.readEntry()
-          return
-        }
-        zipfile.openReadStream(entry, async (err2: Error | null, stream?: Readable) => {
-          if (err2 || !stream) {
-            reject(err2 ?? new Error("zip_entry_stream_failed"))
-            return
-          }
-
-          try {
-            const data = entry.fileName === entryName ? replacement : await readAllReadable(stream)
-            zipOut.addBuffer(data, entry.fileName)
-            zipfile.readEntry()
-          } catch (e) {
-            reject(e)
-          }
-        })
-      })
-
-      zipfile.on("end", () => {
-        resolve()
-      })
-      zipfile.on("error", reject)
-    })
-  })
-
-  zipOut.end()
-  return await outPromise
 }
 
 function parseRelationships(xml: string): Map<string, string> {
@@ -1315,6 +1218,10 @@ function parseTableNode(
 
   const tblBordersNode = tblPr ? childOf(tblPr, "w:tblBorders") : undefined
   const tableBorders = parseTableBordersFromNode(tblBordersNode)
+  
+  // 解析表格样式引用
+  const tblStyleNode = tblPr ? childOf(tblPr, "w:tblStyle") : undefined
+  const tableStyleId = tblStyleNode ? String(attrOf(attrsOf(tblStyleNode), "w:val") ?? "") : undefined
 
   const tblGrid = childOf(tblNode, "w:tblGrid")
   const tableGridColsRaw = tblGrid
@@ -1411,8 +1318,22 @@ function parseTableNode(
         const top = mergeTracker.get(mergeKey)
         if (top) {
           top.rowSpan = (top.rowSpan ?? 1) + 1
+          // 继承顶部单元格的样式到合并的单元格
+          rowStyles[colStart] = {
+            skip: true,
+            fill: top.fill,
+            borders: top.borders,
+            bold: top.bold,
+            italic: top.italic,
+            fontSize: top.fontSize,
+            color: top.color,
+            font: top.font,
+            alignment: top.alignment,
+            verticalAlign: top.verticalAlign
+          }
+        } else {
+          rowStyles[colStart].skip = true
         }
-        rowStyles[colStart].skip = true
         for (let c = colStart + 1; c < colEnd; c += 1) rowStyles[c].skip = true
         colCursor = colEnd
         continue
@@ -1469,7 +1390,7 @@ function parseTableNode(
     cellStyles.push(rowStyles)
   }
 
-  return { text: "", isTable: true, tableData: rows, tableCellStyles: cellStyles, tableLayout, tableGridCols, tableBorders }
+  return { text: "", isTable: true, tableData: rows, tableCellStyles: cellStyles, tableLayout, tableGridCols, tableBorders, tableStyleId }
 }
 
 export async function extractParagraphsFromDocx(docxBuffer: Buffer): Promise<DocxParagraph[]> {
@@ -1566,6 +1487,174 @@ export async function extractParagraphsFromDocx(docxBuffer: Buffer): Promise<Doc
   return outReversed
 }
 
+/**
+ * 扁平化段落列表，将表格行展开为独立的流式单元
+ * 这样可以逐行流式输出表格内容
+ */
+export interface FlattenedElement {
+  type: "paragraph" | "table-row"
+  paragraph?: DocxParagraph
+  tableContext?: {
+    tableIndex: number
+    rowIndex: number
+    totalRows: number
+    tableParagraph: DocxParagraph
+  }
+}
+
+export function flattenParagraphsForStreaming(paragraphs: DocxParagraph[]): FlattenedElement[] {
+  const flattened: FlattenedElement[] = []
+  let tableIndex = 0
+  
+  for (const para of paragraphs) {
+    if (para.isTable && para.tableData) {
+      // 将表格的每一行作为独立的流式单元
+      const totalRows = para.tableData.length
+      for (let rowIndex = 0; rowIndex < totalRows; rowIndex++) {
+        flattened.push({
+          type: "table-row",
+          tableContext: {
+            tableIndex,
+            rowIndex,
+            totalRows,
+            tableParagraph: para
+          }
+        })
+      }
+      tableIndex++
+    } else {
+      // 普通段落直接添加
+      flattened.push({
+        type: "paragraph",
+        paragraph: para
+      })
+    }
+  }
+  
+  return flattened
+}
+
+/**
+ * 根据扁平化的元素列表生成 docx 切片
+ * 支持逐行流式输出表格
+ */
+export async function createDocxFromFlattenedSlice(
+  sourceDocxBuffer: Buffer,
+  flattenedElements: FlattenedElement[],
+  endIndex: number
+): Promise<Buffer> {
+  if (!sourceDocxBuffer || sourceDocxBuffer.length === 0) return Buffer.alloc(0)
+  if (endIndex <= 0) return Buffer.alloc(0)
+
+  const documentXmlBuf = await readZipEntry(sourceDocxBuffer, "word/document.xml")
+  if (!documentXmlBuf) return Buffer.alloc(0)
+
+  const parser = new XMLParser({ ignoreAttributes: false, preserveOrder: true })
+  const ordered: any[] = parser.parse(documentXmlBuf.toString("utf-8"))
+
+  const docNode = ordered.find((n) => tagNameOf(n) === "w:document")
+  if (!docNode) return Buffer.alloc(0)
+  const bodyNode = childOf(docNode, "w:body")
+  if (!bodyNode) return Buffer.alloc(0)
+
+  const bodyChildren = childrenOf(bodyNode)
+  const cloneNode = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T
+
+  const findSectPrFromIndex = (startIndex: number): OrderedXmlNode | undefined => {
+    for (let i = Math.max(0, startIndex); i < bodyChildren.length; i += 1) {
+      const n = bodyChildren[i] as OrderedXmlNode
+      const tn = tagNameOf(n)
+      if (tn === "w:sectPr") return n
+      if (tn === "w:p") {
+        const pPr = childOf(n, "w:pPr")
+        const s = pPr ? childOf(pPr, "w:sectPr") : undefined
+        if (s) return s
+      }
+    }
+    return undefined
+  }
+
+  const newBodyChildren: OrderedXmlNode[] = []
+  let flatIndex = 0
+  let bodyIndex = 0
+  let lastIncludedBodyIndex = -1
+  const tableRowsToInclude = new Map<number, number>() // tableBodyIndex -> rowCount
+
+  // 第一遍：确定每个表格需要包含多少行
+  for (let i = 0; i < Math.min(endIndex, flattenedElements.length); i++) {
+    const elem = flattenedElements[i]!
+    if (elem.type === "table-row" && elem.tableContext) {
+      const key = elem.tableContext.tableIndex
+      const currentCount = tableRowsToInclude.get(key) || 0
+      tableRowsToInclude.set(key, currentCount + 1)
+    }
+  }
+
+  // 第二遍：构建新的 body
+  let currentTableIndex = -1
+  for (let i = 0; i < bodyChildren.length && flatIndex < endIndex; i++) {
+    const n = bodyChildren[i] as OrderedXmlNode
+    const tn = tagNameOf(n)
+    if (tn === "w:sectPr") continue
+
+    if (tn === "w:tbl") {
+      currentTableIndex++
+      const rowsToInclude = tableRowsToInclude.get(currentTableIndex)
+      
+      if (rowsToInclude && rowsToInclude > 0) {
+        // 构建包含部分行的表格
+        const tblPr = childOf(n, "w:tblPr")
+        const tblGrid = childOf(n, "w:tblGrid")
+        const allRows = childrenNamed(n, "w:tr")
+        
+        const partialTable = cloneNode(n)
+        const tableKey = "w:tbl"
+        const tableChildren: OrderedXmlNode[] = []
+        
+        if (tblPr) tableChildren.push(cloneNode(tblPr))
+        if (tblGrid) tableChildren.push(cloneNode(tblGrid))
+        
+        // 只包含需要的行数
+        for (let r = 0; r < Math.min(rowsToInclude, allRows.length); r++) {
+          tableChildren.push(cloneNode(allRows[r]!))
+          flatIndex++
+        }
+        
+        partialTable[tableKey] = tableChildren
+        newBodyChildren.push(partialTable)
+        lastIncludedBodyIndex = i
+      }
+      
+      bodyIndex++
+      continue
+    }
+
+    if (tn === "w:p") {
+      newBodyChildren.push(cloneNode(n))
+      lastIncludedBodyIndex = i
+      flatIndex++
+      bodyIndex++
+    }
+  }
+
+  const sectPrForChunk = findSectPrFromIndex(lastIncludedBodyIndex)
+  if (sectPrForChunk) newBodyChildren.push(cloneNode(sectPrForChunk))
+
+  const bodyKey = "w:body"
+  bodyNode[bodyKey] = newBodyChildren
+
+  const newDocumentXml = buildXml(ordered, { ignoreAttributes: false, preserveOrder: true, format: false })
+
+  return await replaceZipEntry(sourceDocxBuffer, "word/document.xml", Buffer.from(newDocumentXml, "utf-8"))
+}
+
+/**
+ * 从源 docx 创建切片，支持逐行流式输出表格
+ * 
+ * @param sourceDocxBuffer 源 docx 文件的 Buffer
+ * @param bodyElementCount 要包含的 body 元素数量（段落按1计，表格的每一行也按1计）
+ * @returns 包含指定数量元素的 docx Buffer
+ */
 export async function createDocxFromSourceDocxSlice(sourceDocxBuffer: Buffer, bodyElementCount: number): Promise<Buffer> {
   if (!sourceDocxBuffer || sourceDocxBuffer.length === 0) return Buffer.alloc(0)
 
@@ -1600,23 +1689,61 @@ export async function createDocxFromSourceDocxSlice(sourceDocxBuffer: Buffer, bo
   const newBodyChildren: OrderedXmlNode[] = []
   let included = 0
   let lastIncludedBodyIndex = -1
-  for (let i = 0; i < bodyChildren.length; i += 1) {
+  
+  for (let i = 0; i < bodyChildren.length && included < bodyElementCount; i += 1) {
     const n = bodyChildren[i] as OrderedXmlNode
     const tn = tagNameOf(n)
     if (tn === "w:sectPr") continue
-    newBodyChildren.push(n)
-    lastIncludedBodyIndex = i
-    if (tn === "w:p" || tn === "w:tbl") included += 1
-    if (included >= bodyElementCount) break
+    
+    // 处理表格：逐行包含
+    if (tn === "w:tbl") {
+      const tblPr = childOf(n, "w:tblPr")
+      const tblGrid = childOf(n, "w:tblGrid")
+      const allRows = childrenNamed(n, "w:tr")
+      
+      // 计算还能包含多少行
+      const remainingCount = bodyElementCount - included
+      const rowsToInclude = Math.min(remainingCount, allRows.length)
+      
+      if (rowsToInclude > 0) {
+        // 构建包含部分行的表格
+        const partialTable = cloneNode(n)
+        const tableKey = "w:tbl"
+        const tableChildren: OrderedXmlNode[] = []
+        
+        // 添加表格属性和网格定义
+        if (tblPr) tableChildren.push(cloneNode(tblPr))
+        if (tblGrid) tableChildren.push(cloneNode(tblGrid))
+        
+        // 添加指定数量的行
+        for (let r = 0; r < rowsToInclude; r++) {
+          tableChildren.push(cloneNode(allRows[r]!))
+        }
+        
+        partialTable[tableKey] = tableChildren
+        newBodyChildren.push(partialTable)
+        lastIncludedBodyIndex = i
+        included += rowsToInclude
+      }
+      
+      continue
+    }
+    
+    // 处理普通段落
+    if (tn === "w:p") {
+      newBodyChildren.push(cloneNode(n))
+      lastIncludedBodyIndex = i
+      included += 1
+    }
   }
+  
   const sectPrForChunk = findSectPrFromIndex(lastIncludedBodyIndex)
   if (sectPrForChunk) newBodyChildren.push(cloneNode(sectPrForChunk))
 
   const bodyKey = "w:body"
   bodyNode[bodyKey] = newBodyChildren
 
-  const builder = new XMLBuilder({ ignoreAttributes: false, preserveOrder: true, format: false })
-  const newDocumentXml = builder.build(ordered)
+  const newDocumentXml = buildXml(ordered, { ignoreAttributes: false, preserveOrder: true, format: false })
 
   return await replaceZipEntry(sourceDocxBuffer, "word/document.xml", Buffer.from(newDocumentXml, "utf-8"))
 }
