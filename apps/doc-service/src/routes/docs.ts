@@ -2,9 +2,12 @@ import type { Router } from "../http/router.js"
 import type { DocStore } from "../docStore/types.js"
 import { pipeDocxChunksToResponse } from "@wps/doc-core"
 import { URL } from "node:url"
-import { createDocxFromSourceDocxSlice } from "../docStore/docxGenerator.js"
-import { parseDocx, getDocxStatistics } from "../docStore/docxParser.js"
-import type { SectionPropertiesSpec } from "../docStore/docxGenerator.js"
+import { 
+  streamDocxSlices,
+  parseDocxDocument,
+  getDocumentStatistics,
+  type SectionPropertiesSpec
+} from "../docStore/docx/index.js"
 import type { Readable } from "node:stream"
 
 function randomIntInclusive(min: number, max: number): number {
@@ -87,8 +90,7 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     const { stream } = await deps.docStore.openStream(docId)
     const docxBuffer = await readableToBuffer(stream)
     
-    // 使用统一解析器（只解析段落，不解析元数据）
-    const doc = await parseDocx(docxBuffer, {})
+    const doc = await parseDocxDocument(docxBuffer, {})
     const allParagraphs = doc.paragraphs
 
     const firstSection = allParagraphs.find((p: any) => p.sectionProperties)?.sectionProperties
@@ -110,9 +112,8 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
         }
       }
       
-      // 逐个单元生成 docx 块
       for (let i = 0; i < totalUnits; i += 1) {
-        yield await createDocxFromSourceDocxSlice(docxBuffer, i + 1)
+        yield await streamDocxSlices(docxBuffer, i + 1)
       }
     }
 
@@ -136,8 +137,7 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     const { stream } = await deps.docStore.openStream(docId)
     const docxBuffer = await readableToBuffer(stream)
     
-    // 使用统一解析器（包含元数据）
-    const fullDoc = await parseDocx(docxBuffer, {
+    const fullDoc = await parseDocxDocument(docxBuffer, {
       includeMetadata: true,
       includeHeadersFooters: true,
       includeComments: true,
@@ -145,17 +145,13 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     })
     const allParagraphs = fullDoc.paragraphs
 
-    // 提取页面设置信息
     const firstSection = allParagraphs.find((p: any) => p.sectionProperties)?.sectionProperties
     const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
     
-    // 添加增强的元数据到响应头
+    const stats = getDocumentStatistics(fullDoc)
     res.setHeader("X-WPS-PageSetup-Unit", "point")
     res.setHeader("X-WPS-PageSetup-Source-Unit", "twip")
     res.setHeader("X-WPS-PageSetup", encodeURIComponent(JSON.stringify(pageSetupPoints ?? {})))
-    
-    // 添加文档统计信息
-    const stats = getDocxStatistics(fullDoc)
     res.setHeader("X-WPS-Doc-Stats", encodeURIComponent(JSON.stringify({
       paragraphCount: stats.paragraphCount,
       tableCount: stats.tableCount,
@@ -180,9 +176,8 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
         }
       }
       
-      // 逐个单元生成 docx 块（支持逐行输出表格）
       for (let i = 0; i < totalUnits; i += 1) {
-        yield await createDocxFromSourceDocxSlice(docxBuffer, i + 1)
+        yield await streamDocxSlices(docxBuffer, i + 1)
       }
     }
 

@@ -1,7 +1,7 @@
 import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, AlignmentType, UnderlineType, IRunOptions, PageOrientation } from "docx"
 import { XMLParser } from "fast-xml-parser"
-import { readZipEntry, replaceZipEntry } from "./core/zipReader.js"
-import { parseXml, buildXml } from "./core/xmlParser.js"
+import { readZipEntry, replaceZipEntry } from "./docx/core/zip-reader.js"
+import { buildXml } from "./docx/core/xml-parser.js"
 
 export type BorderSpec = {
   style?: string
