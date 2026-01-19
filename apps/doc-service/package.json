@@ -5,7 +5,10 @@
   "type": "module",
   "dependencies": {
     "@wps/doc-core": "0.1.0",
-    "docx": "^9.5.1"
+    "docx": "^9.5.1",
+    "fast-xml-parser": "^4.5.3",
+    "yazl": "^2.5.1",
+    "yauzl": "^3.2.0"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
@@ -16,6 +19,8 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
+    "@types/yazl": "^2.4.5",
+    "@types/yauzl": "^2.10.3",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }

@@ -2,7 +2,10 @@ import type { Router } from "../http/router.js"
 import type { DocStore } from "../docStore/types.js"
 import { HttpError, pipeAsyncIterableToResponseAsNdjson, pipeReadableToResponse, pipeReadableToResponseAsFramedChunks, pipeDocxChunksToResponse } from "@wps/doc-core"
 import { URL } from "node:url"
-import { extractParagraphsFromDocx, createDocxFromParagraphs } from "../docStore/docxGenerator.js"
+import { createDocxFromSourceDocxSlice, extractParagraphsFromDocx } from "../docStore/docxGenerator.js"
+import { parseFullDocx, getDocxStatistics } from "../docStore/docxFullParser.js"
+import type { SectionPropertiesSpec } from "../docStore/docxGenerator.js"
+import type { Readable } from "node:stream"
 
 const DEFAULT_DOC_ID = "test.docx"
 
@@ -23,6 +26,50 @@ function getQueryParam(req: import("node:http").IncomingMessage, key: string): s
   const url = new URL(req.url ?? "/", "http://localhost")
   const val = url.searchParams.get(key)
   return val == null || val === "" ? undefined : val
+}
+
+function twipsToPoints(v: unknown): number | undefined {
+  const n = typeof v === "number" ? v : Number(v)
+  if (!Number.isFinite(n)) return undefined
+  return n / 20
+}
+
+function sectionPropertiesToPageSetupPoints(section: SectionPropertiesSpec | undefined): Record<string, any> | undefined {
+  if (!section) return undefined
+
+  const page = section.page ?? {}
+  const size = page.size ?? {}
+  const margin = page.margin ?? {}
+  const column = section.column ?? {}
+
+  const out: Record<string, any> = {}
+
+  const pageWidth = twipsToPoints(size.width)
+  const pageHeight = twipsToPoints(size.height)
+  if (pageWidth != null) out.pageWidth = pageWidth
+  if (pageHeight != null) out.pageHeight = pageHeight
+  if (size.orientation === "landscape" || size.orientation === "portrait") out.orientation = size.orientation
+
+  const topMargin = twipsToPoints(margin.top)
+  const rightMargin = twipsToPoints(margin.right)
+  const bottomMargin = twipsToPoints(margin.bottom)
+  const leftMargin = twipsToPoints(margin.left)
+  const headerDistance = twipsToPoints(margin.header)
+  const footerDistance = twipsToPoints(margin.footer)
+  const gutter = twipsToPoints(margin.gutter)
+
+  if (topMargin != null) out.topMargin = topMargin
+  if (rightMargin != null) out.rightMargin = rightMargin
+  if (bottomMargin != null) out.bottomMargin = bottomMargin
+  if (leftMargin != null) out.leftMargin = leftMargin
+  if (headerDistance != null) out.headerDistance = headerDistance
+  if (footerDistance != null) out.footerDistance = footerDistance
+  if (gutter != null) out.gutter = gutter
+
+  if (typeof column.count === "number" && Number.isFinite(column.count)) out.columnsCount = column.count
+  if (typeof column.space === "number" && Number.isFinite(column.space)) out.columnsSpace = twipsToPoints(column.space)
+
+  return Object.keys(out).length ? out : undefined
 }
 
 export function registerDocRoutes(router: Router, deps: { docStore: DocStore }): void {
@@ -181,22 +228,129 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     res.setHeader("X-WPS-Delay-Ms", String(delayMs))
     
     if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
+
+    async function readableToBuffer(stream: Readable): Promise<Buffer> {
+      const chunks: Buffer[] = []
+      for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+      return Buffer.concat(chunks)
+    }
+
+    const docId = getQueryParam(req, "docId") || "mock.docx"
+    const { stream } = await deps.docStore.openStream(docId)
+    const docxBuffer = await readableToBuffer(stream)
+    const allParagraphs = await extractParagraphsFromDocx(docxBuffer)
+
+    const firstSection = allParagraphs.find((p) => p.sectionProperties)?.sectionProperties
+    const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
+    res.setHeader("X-WPS-PageSetup-Unit", "point")
+    res.setHeader("X-WPS-PageSetup-Source-Unit", "twip")
+    res.setHeader("X-WPS-PageSetup", encodeURIComponent(JSON.stringify(pageSetupPoints ?? {})))
+
     if (typeof res.flushHeaders === "function") res.flushHeaders()
 
-    // 生成器：逐段落生成完整 docx
     async function* generateDocxChunks(): AsyncGenerator<Buffer> {
-      // 提取段落（实际项目中从真实文档提取）
-      const allParagraphs = await extractParagraphsFromDocx(Buffer.alloc(0))
-      
-      // 逐个段落生成完整 docx
-      for (let i = 0; i < allParagraphs.length; i++) {
-        const paragraphsUpToNow = allParagraphs.slice(0, i + 1)
-        const docxBuffer = await createDocxFromParagraphs(paragraphsUpToNow)
-        yield docxBuffer
+      for (let i = 0; i < allParagraphs.length; i += 1) {
+        yield await createDocxFromSourceDocxSlice(docxBuffer, i + 1)
       }
     }
 
     await pipeDocxChunksToResponse(req, res, generateDocxChunks(), { delayMs })
+  })
+
+  router.add("GET", "/api/v1/docs/frames-docx", async ({ req, res }) => {
+    const origin = getRequestOrigin(req)
+    const docId = getQueryParam(req, "docId") || "mock.docx"
+
+    const delayMs = randomIntInclusive(30, 80)
+    res.statusCode = 200
+    res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.setHeader("Cache-Control", "no-store")
+    res.setHeader("X-WPS-Stream-Mode", "ndjson-frames")
+    res.setHeader("X-WPS-Delay-Ms", String(delayMs))
+    if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
+    if (typeof res.flushHeaders === "function") res.flushHeaders()
+
+    async function readableToBuffer(stream: Readable): Promise<Buffer> {
+      const chunks: Buffer[] = []
+      for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+      return Buffer.concat(chunks)
+    }
+
+    async function* frames(): AsyncGenerator<unknown> {
+      let seq = 1
+      const ts = () => Date.now()
+
+      const { meta, stream } = await deps.docStore.openStream(docId)
+      const docxBuffer = await readableToBuffer(stream)
+      const paragraphs = await extractParagraphsFromDocx(docxBuffer)
+      const firstSection = paragraphs.find((p) => p.sectionProperties)?.sectionProperties
+      const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
+
+      yield {
+        docId,
+        seq,
+        type: "preview.pageSetup",
+        ts: ts(),
+        payload: {
+          unit: "point",
+          pageSetup: pageSetupPoints ?? {},
+          sourceSectionProperties: firstSection ?? {},
+          sourceUnit: "twip"
+        }
+      }
+      seq += 1
+
+      for (let i = 0; i < paragraphs.length; i += 1) {
+        yield {
+          docId,
+          seq,
+          type: "preview.paragraphs",
+          ts: ts(),
+          payload: { unit: "twip", paragraphs: [paragraphs[i]!] }
+        }
+        seq += 1
+      }
+
+      yield {
+        docId,
+        seq,
+        type: "final.docx.url",
+        ts: ts(),
+        payload: {
+          url: `${origin}/api/v1/docs/${encodeURIComponent(docId)}/download`,
+          fileName: meta.filename,
+          expiresAt: ts() + 10 * 60_000
+        }
+      }
+      seq += 1
+
+      yield { docId, seq, type: "control.done", ts: ts(), payload: { reason: "completed" } }
+    }
+
+    await pipeAsyncIterableToResponseAsNdjson(req, res, frames(), { delayMs })
+  })
+
+  router.add("GET", "/api/v1/docs/parsed", async ({ req, res }) => {
+    const docId = getQueryParam(req, "docId") || "mock.docx"
+    const takeRaw = getQueryParam(req, "take")
+    const take = takeRaw ? Number.parseInt(takeRaw, 10) : undefined
+
+    const { stream } = await deps.docStore.openStream(docId)
+    const chunks: Buffer[] = []
+    for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+    const docxBuffer = Buffer.concat(chunks)
+
+    let paragraphs = await extractParagraphsFromDocx(docxBuffer)
+    if (take != null && Number.isFinite(take) && take >= 0) {
+      paragraphs = paragraphs.slice(0, take)
+    }
+
+    res.statusCode = 200
+    res.setHeader("Content-Type", "application/json; charset=utf-8")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.setHeader("Cache-Control", "no-store")
+    res.end(JSON.stringify({ docId, count: paragraphs.length, paragraphs }))
   })
 
   router.add("GET", "/api/v1/docs/:docId/download", async ({ req, res, params }) => {
@@ -232,5 +386,28 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
 
   router.add("GET", "/docs/download", async ({ req, res }) => {
     await sendDefaultDownload(req, res)
+  })
+
+  // 新接口：完整解析文档（包含所有元素）
+  router.add("GET", "/api/v1/docs/full-parse", async ({ req, res }) => {
+    const docId = getQueryParam(req, "docId") || "mock.docx"
+    
+    const { stream } = await deps.docStore.openStream(docId)
+    const chunks: Buffer[] = []
+    for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+    const docxBuffer = Buffer.concat(chunks)
+    
+    const fullDoc = await parseFullDocx(docxBuffer)
+    const stats = getDocxStatistics(fullDoc)
+    
+    res.statusCode = 200
+    res.setHeader("Content-Type", "application/json; charset=utf-8")
+    res.setHeader("X-Content-Type-Options", "nosniff")
+    res.setHeader("Cache-Control", "no-store")
+    res.end(JSON.stringify({ 
+      docId, 
+      statistics: stats,
+      document: fullDoc 
+    }, null, 2))
   })
 }

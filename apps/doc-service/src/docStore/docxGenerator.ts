@@ -1,4 +1,30 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, AlignmentType, UnderlineType, IRunOptions } from "docx"
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, BorderStyle, AlignmentType, UnderlineType, IRunOptions, PageOrientation } from "docx"
+import { XMLBuilder, XMLParser } from "fast-xml-parser"
+import { createRequire } from "node:module"
+import type { Readable } from "node:stream"
+import type { Entry, ZipFile } from "yauzl"
+
+export type BorderSpec = {
+  style?: string
+  size?: number
+  color?: string
+}
+
+export type TableBordersSpec = {
+  top?: BorderSpec
+  bottom?: BorderSpec
+  left?: BorderSpec
+  right?: BorderSpec
+  insideHorizontal?: BorderSpec
+  insideVertical?: BorderSpec
+}
+
+export type CellBordersSpec = {
+  top?: BorderSpec
+  bottom?: BorderSpec
+  left?: BorderSpec
+  right?: BorderSpec
+}
 
 export interface CellStyle {
   bold?: boolean
@@ -6,10 +32,111 @@ export interface CellStyle {
   fontSize?: number
   color?: string
   fill?: string  // 背景色
-  alignment?: "left" | "center" | "right"
+  alignment?: "left" | "center" | "right" | "justify"
   gridSpan?: number  // 合并列数
+  rowSpan?: number
+  colIndex?: number
+  skip?: boolean
   font?: string  // 字体名称
   verticalAlign?: "top" | "center" | "bottom"  // 垂直对齐
+  borders?: CellBordersSpec
+}
+
+// 图片/图形
+export interface ImageSpec {
+  type: "image"
+  relationshipId?: string
+  imageData?: string  // base64 或 URL
+  width?: number
+  height?: number
+  description?: string
+  title?: string
+  hyperlink?: string
+}
+
+// 列表/编号
+export interface NumberingSpec {
+  numId?: number
+  level?: number
+  format?: string  // bullet, decimal, lowerLetter, etc.
+  text?: string  // 自定义编号文本
+}
+
+// 书签
+export interface BookmarkSpec {
+  id: string
+  name: string
+  type: "start" | "end"
+}
+
+// 域代码（字段）
+export interface FieldSpec {
+  type: "field"
+  code?: string  // 域代码，如 "TOC \o \"1-3\""
+  result?: string  // 域结果
+  fieldType?: "toc" | "pageref" | "ref" | "hyperlink" | "date" | "time" | "formula" | "other"
+}
+
+// 脚注/尾注
+export interface NoteSpec {
+  type: "footnote" | "endnote"
+  id: string
+  content?: DocxParagraph[]
+}
+
+// 注释
+export interface CommentSpec {
+  id: string
+  author?: string
+  date?: string
+  content?: string
+  rangeType: "start" | "end"
+}
+
+// 文本框
+export interface TextBoxSpec {
+  type: "textbox"
+  content?: DocxParagraph[]
+  width?: number
+  height?: number
+  positioning?: {
+    x?: number
+    y?: number
+    anchor?: "page" | "paragraph" | "margin"
+  }
+}
+
+// 形状
+export interface ShapeSpec {
+  type: "shape"
+  shapeType?: string  // rect, ellipse, line, etc.
+  width?: number
+  height?: number
+  fill?: string
+  stroke?: string
+  strokeWidth?: number
+  text?: string
+}
+
+// 修订标记
+export interface RevisionSpec {
+  type: "insert" | "delete" | "format"
+  author?: string
+  date?: string
+  content?: string
+}
+
+// 数学公式 (OMML)
+export interface MathSpec {
+  type: "math"
+  omml?: string  // Office Math Markup Language
+  latex?: string  // 转换后的 LaTeX（可选）
+}
+
+// 嵌套表格
+export interface NestedTableSpec {
+  type: "nestedTable"
+  table: DocxParagraph  // 指向表格段落
 }
 
 export interface RunStyle {
@@ -20,6 +147,47 @@ export interface RunStyle {
   fontSize?: number
   color?: string
   font?: string
+  highlight?: string  // 高亮颜色
+  strikethrough?: boolean
+  doubleStrikethrough?: boolean
+  subscript?: boolean
+  superscript?: boolean
+  smallCaps?: boolean
+  allCaps?: boolean
+  emboss?: boolean
+  imprint?: boolean
+  shadow?: boolean
+  outline?: boolean
+}
+
+export type ParagraphSpacing = {
+  before?: number
+  after?: number
+  line?: number
+  lineRule?: "auto" | "exact" | "atLeast"
+}
+
+export type SectionPropertiesSpec = {
+  page?: {
+    size?: {
+      width?: number
+      height?: number
+      orientation?: "portrait" | "landscape"
+    }
+    margin?: {
+      top?: number
+      right?: number
+      bottom?: number
+      left?: number
+      header?: number
+      footer?: number
+      gutter?: number
+    }
+  }
+  column?: {
+    count?: number
+    space?: number
+  }
 }
 
 export interface DocxParagraph {
@@ -31,252 +199,1426 @@ export interface DocxParagraph {
   color?: string
   font?: string
   headingLevel?: 1 | 2 | 3 | 4 | 5 | 6
-  alignment?: "left" | "center" | "right"
+  alignment?: "left" | "center" | "right" | "justify"
+  spacing?: ParagraphSpacing
   isTable?: boolean
   tableData?: string[][]
   tableCellStyles?: CellStyle[][]  // 单元格样式
+  tableLayout?: "fixed" | "autofit"
+  tableGridCols?: number[]
+  tableBorders?: TableBordersSpec
   link?: string
   runs?: RunStyle[]  // 支持多个 run（用于处理混合样式段落）
+  sectionProperties?: SectionPropertiesSpec
+  
+  // 新增：扩展元素
+  images?: ImageSpec[]
+  numbering?: NumberingSpec
+  bookmarks?: BookmarkSpec[]
+  fields?: FieldSpec[]
+  notes?: NoteSpec[]
+  comments?: CommentSpec[]
+  textBoxes?: TextBoxSpec[]
+  shapes?: ShapeSpec[]
+  revisions?: RevisionSpec[]
+  math?: MathSpec[]
+  indent?: {
+    left?: number
+    right?: number
+    firstLine?: number
+    hanging?: number
+  }
+  keepNext?: boolean  // 与下一段保持在同一页
+  keepLines?: boolean  // 段落内不分页
+  pageBreakBefore?: boolean
+  widowControl?: boolean
+  outlineLevel?: number
+  styleId?: string
+  styleName?: string
 }
 
-/**
- * 从完整文档中提取段落
- * 
- * ⚠️ 本函数数据完全基于 Python XML 解析器从 text.docx 提取的真实样式
- * 解析工具：parse-docx-complete.py
- * 数据来源：text-docx-complete.json
- */
-export async function extractParagraphsFromDocx(_docxBuffer: Buffer): Promise<DocxParagraph[]> {
-  return [
-    // 段落 1: 主标题 - 36pt, 居中, 粗体, 黑色, 微软雅黑
-    { 
-      text: "AI 应用的发展与落地：从能力到价值闭环", 
-      fontSize: 18,  // 36/2
-      alignment: "center", 
-      bold: true, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑"
-    },
+type StyleMap = Map<string, { type?: string; basedOn?: string; name?: string; run?: Partial<RunStyle>; para?: Pick<DocxParagraph, "alignment" | "headingLevel"> }>
+
+type OrderedXmlNode = Record<string, any>
+
+function asArray<T>(v: T | T[] | undefined | null): T[] {
+  if (!v) return []
+  return Array.isArray(v) ? v : [v]
+}
+
+function parseBooleanOnOff(v: unknown, defaultWhenMissingVal?: true): boolean | undefined {
+  if (v == null) return defaultWhenMissingVal ? true : undefined
+  const s = String(v).trim().toLowerCase()
+  if (s === "0" || s === "false" || s === "off" || s === "none") return false
+  return true
+}
+
+function normalizeColor(v: unknown): string | undefined {
+  if (!v) return undefined
+  const s = String(v).trim()
+  if (!s || s.toLowerCase() === "auto") return undefined
+  const hex = s.replace(/^#/, "").toUpperCase()
+  if (!/^[0-9A-F]{6}$/.test(hex)) return undefined
+  return hex
+}
+
+function normalizeBorderColor(v: unknown): string | undefined {
+  if (!v) return undefined
+  const s = String(v).trim()
+  if (!s) return undefined
+  if (s.toLowerCase() === "auto") return "auto"
+  const hex = s.replace(/^#/, "").toUpperCase()
+  if (!/^[0-9A-F]{6}$/.test(hex)) return undefined
+  return hex
+}
+
+function normalizeAlignment(v: unknown): "left" | "center" | "right" | "justify" | undefined {
+  const s = String(v ?? "").trim().toLowerCase()
+  if (!s) return undefined
+  if (s === "center") return "center"
+  if (s === "right" || s === "end") return "right"
+  if (s === "left" || s === "start") return "left"
+  if (s === "both" || s === "justify") return "justify"
+  return undefined
+}
+
+function tagNameOf(node: OrderedXmlNode): string | undefined {
+  const keys = Object.keys(node)
+  for (const k of keys) {
+    if (k === ":@" || k === "#text") continue
+    return k
+  }
+  if (keys.includes("#text")) return "#text"
+  return undefined
+}
+
+function attrsOf(node: OrderedXmlNode): Record<string, any> {
+  const attrs = node[":@"]
+  if (!attrs || typeof attrs !== "object") return {}
+  return attrs
+}
+
+function attrOf(attrs: Record<string, any>, name: string): any {
+  if (name in attrs) return attrs[name]
+  const alt = `@_${name}`
+  if (alt in attrs) return attrs[alt]
+  return undefined
+}
+
+function childrenOf(node: OrderedXmlNode): OrderedXmlNode[] {
+  const tn = tagNameOf(node)
+  if (!tn || tn === "#text") return []
+  const v = node[tn]
+  return Array.isArray(v) ? v : []
+}
+
+function childOf(node: OrderedXmlNode, name: string): OrderedXmlNode | undefined {
+  for (const c of childrenOf(node)) {
+    if (tagNameOf(c) === name) return c
+  }
+  return undefined
+}
+
+function childrenNamed(node: OrderedXmlNode, name: string): OrderedXmlNode[] {
+  return childrenOf(node).filter((c) => tagNameOf(c) === name)
+}
+
+function textFromOrdered(node: OrderedXmlNode): string {
+  const tn = tagNameOf(node)
+  if (tn === "#text") return String((node as any)["#text"] ?? "")
+
+  if (tn === "w:t") {
+    const children = childrenOf(node)
+    if (children.length === 0) return ""
+    return children.map(textFromOrdered).join("")
+  }
+
+  if (tn === "w:tab") return "\t"
+  if (tn === "w:br" || tn === "w:cr") return "\n"
+
+  return childrenOf(node).map(textFromOrdered).join("")
+}
+
+function parseRunPropsFromOrdered(rPr: OrderedXmlNode | undefined): { props: Partial<RunStyle>; charStyleId?: string } {
+  if (!rPr) return { props: {} }
+
+  const props: Partial<RunStyle> = {}
+  let charStyleId: string | undefined
+
+  for (const c of childrenOf(rPr)) {
+    const tn = tagNameOf(c)
+    const attrs = attrsOf(c)
+
+    if (tn === "w:rStyle") {
+      const v = attrOf(attrs, "w:val")
+      if (typeof v === "string" && v) charStyleId = v
+    } else if (tn === "w:b") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.bold = on
+    } else if (tn === "w:i") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.italic = on
+    } else if (tn === "w:u") {
+      const v = String(attrOf(attrs, "w:val") ?? "").trim().toLowerCase()
+      if (!v) {
+        props.underline = true
+      } else if (v === "none") {
+        props.underline = false
+      } else {
+        props.underline = true
+      }
+    } else if (tn === "w:color") {
+      const col = normalizeColor(attrOf(attrs, "w:val"))
+      if (col) props.color = col
+    } else if (tn === "w:sz") {
+      const raw = Number.parseInt(String(attrOf(attrs, "w:val") ?? ""), 10)
+      if (Number.isFinite(raw)) props.fontSize = raw / 2
+    } else if (tn === "w:szCs") {
+      if (props.fontSize === undefined) {
+        const raw = Number.parseInt(String(attrOf(attrs, "w:val") ?? ""), 10)
+        if (Number.isFinite(raw)) props.fontSize = raw / 2
+      }
+    } else if (tn === "w:rFonts") {
+      const font = (attrOf(attrs, "w:eastAsia") ?? attrOf(attrs, "w:ascii") ?? attrOf(attrs, "w:hAnsi")) as unknown
+      if (typeof font === "string" && font) props.font = font
+    } else if (tn === "w:highlight") {
+      const col = normalizeColor(attrOf(attrs, "w:val"))
+      if (col) props.highlight = col
+    } else if (tn === "w:strike") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.strikethrough = on
+    } else if (tn === "w:dstrike") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.doubleStrikethrough = on
+    } else if (tn === "w:vertAlign") {
+      const v = String(attrOf(attrs, "w:val") ?? "").trim().toLowerCase()
+      if (v === "subscript") props.subscript = true
+      if (v === "superscript") props.superscript = true
+    } else if (tn === "w:smallCaps") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.smallCaps = on
+    } else if (tn === "w:caps") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.allCaps = on
+    } else if (tn === "w:emboss") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.emboss = on
+    } else if (tn === "w:imprint") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.imprint = on
+    } else if (tn === "w:shadow") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.shadow = on
+    } else if (tn === "w:outline") {
+      const on = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+      if (on !== undefined) props.outline = on
+    }
+  }
+
+  return { props, charStyleId }
+}
+
+function parseParaPropsFromOrdered(pPr: OrderedXmlNode | undefined): {
+  alignment?: "left" | "center" | "right" | "justify"
+  paraStyleId?: string
+  runDefaults?: Partial<RunStyle>
+  spacing?: ParagraphSpacing
+  numbering?: NumberingSpec
+  indent?: { left?: number; right?: number; firstLine?: number; hanging?: number }
+  keepNext?: boolean
+  keepLines?: boolean
+  pageBreakBefore?: boolean
+  widowControl?: boolean
+  outlineLevel?: number
+} {
+  if (!pPr) return {}
+
+  let alignment: "left" | "center" | "right" | "justify" | undefined
+  let paraStyleId: string | undefined
+  let runDefaults: Partial<RunStyle> | undefined
+  let spacing: ParagraphSpacing | undefined
+  let numbering: NumberingSpec | undefined
+  let indent: { left?: number; right?: number; firstLine?: number; hanging?: number } | undefined
+  let keepNext: boolean | undefined
+  let keepLines: boolean | undefined
+  let pageBreakBefore: boolean | undefined
+  let widowControl: boolean | undefined
+  let outlineLevel: number | undefined
+
+  for (const c of childrenOf(pPr)) {
+    const tn = tagNameOf(c)
+    const attrs = attrsOf(c)
+    if (tn === "w:jc") {
+      alignment = normalizeAlignment(attrOf(attrs, "w:val"))
+    } else if (tn === "w:pStyle") {
+      const v = attrOf(attrs, "w:val")
+      if (typeof v === "string" && v) paraStyleId = v
+    } else if (tn === "w:rPr") {
+      runDefaults = parseRunPropsFromOrdered(c).props
+    } else if (tn === "w:spacing") {
+      const beforeRaw = Number.parseInt(String(attrOf(attrs, "w:before") ?? ""), 10)
+      const afterRaw = Number.parseInt(String(attrOf(attrs, "w:after") ?? ""), 10)
+      const lineRaw = Number.parseInt(String(attrOf(attrs, "w:line") ?? ""), 10)
+      const lineRuleRaw = String(attrOf(attrs, "w:lineRule") ?? "").trim().toLowerCase()
+
+      const s: ParagraphSpacing = {}
+      if (Number.isFinite(beforeRaw)) s.before = beforeRaw
+      if (Number.isFinite(afterRaw)) s.after = afterRaw
+      if (Number.isFinite(lineRaw)) s.line = lineRaw
+      if (lineRuleRaw === "auto" || lineRuleRaw === "exact" || lineRuleRaw === "atleast") {
+        s.lineRule = lineRuleRaw === "atleast" ? "atLeast" : (lineRuleRaw as any)
+      }
+      if (Object.keys(s).length) spacing = s
+    } else if (tn === "w:numPr") {
+      const numIdNode = childOf(c, "w:numId")
+      const ilvlNode = childOf(c, "w:ilvl")
+      const numIdRaw = numIdNode ? Number.parseInt(String(attrOf(attrsOf(numIdNode), "w:val") ?? ""), 10) : NaN
+      const ilvlRaw = ilvlNode ? Number.parseInt(String(attrOf(attrsOf(ilvlNode), "w:val") ?? ""), 10) : NaN
+      numbering = {
+        numId: Number.isFinite(numIdRaw) ? numIdRaw : undefined,
+        level: Number.isFinite(ilvlRaw) ? ilvlRaw : undefined
+      }
+    } else if (tn === "w:ind") {
+      const leftRaw = Number.parseInt(String(attrOf(attrs, "w:left") ?? attrOf(attrs, "w:start") ?? ""), 10)
+      const rightRaw = Number.parseInt(String(attrOf(attrs, "w:right") ?? attrOf(attrs, "w:end") ?? ""), 10)
+      const firstLineRaw = Number.parseInt(String(attrOf(attrs, "w:firstLine") ?? ""), 10)
+      const hangingRaw = Number.parseInt(String(attrOf(attrs, "w:hanging") ?? ""), 10)
+      indent = {}
+      if (Number.isFinite(leftRaw)) indent.left = leftRaw
+      if (Number.isFinite(rightRaw)) indent.right = rightRaw
+      if (Number.isFinite(firstLineRaw)) indent.firstLine = firstLineRaw
+      if (Number.isFinite(hangingRaw)) indent.hanging = hangingRaw
+      if (!Object.keys(indent).length) indent = undefined
+    } else if (tn === "w:keepNext") {
+      keepNext = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+    } else if (tn === "w:keepLines") {
+      keepLines = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+    } else if (tn === "w:pageBreakBefore") {
+      pageBreakBefore = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+    } else if (tn === "w:widowControl") {
+      widowControl = parseBooleanOnOff(attrOf(attrs, "w:val"), true)
+    } else if (tn === "w:outlineLvl") {
+      const lvl = Number.parseInt(String(attrOf(attrs, "w:val") ?? ""), 10)
+      if (Number.isFinite(lvl)) outlineLevel = lvl
+    }
+  }
+
+  return { alignment, paraStyleId, runDefaults, spacing, numbering, indent, keepNext, keepLines, pageBreakBefore, widowControl, outlineLevel }
+}
+
+function parseRunPropsFromObj(rPr: any): Partial<RunStyle> {
+  if (!rPr || typeof rPr !== "object") return {}
+
+  const props: Partial<RunStyle> = {}
+
+  if (rPr["w:b"] != null) {
+    const v = rPr["w:b"]?.["@_w:val"]
+    const on = parseBooleanOnOff(v, true)
+    if (on !== undefined) props.bold = on
+  }
+  if (rPr["w:i"] != null) {
+    const v = rPr["w:i"]?.["@_w:val"]
+    const on = parseBooleanOnOff(v, true)
+    if (on !== undefined) props.italic = on
+  }
+  if (rPr["w:u"] != null) {
+    const v = String(rPr["w:u"]?.["@_w:val"] ?? "").trim().toLowerCase()
+    if (!v) {
+      props.underline = true
+    } else if (v === "none") {
+      props.underline = false
+    } else {
+      props.underline = true
+    }
+  }
+  const sz = rPr["w:sz"]?.["@_w:val"]
+  const szCs = rPr["w:szCs"]?.["@_w:val"]
+  const sizeRaw = sz != null ? sz : szCs
+  if (sizeRaw != null) {
+    const raw = Number.parseInt(String(sizeRaw), 10)
+    if (Number.isFinite(raw)) props.fontSize = raw / 2
+  }
+  const col = normalizeColor(rPr["w:color"]?.["@_w:val"])
+  if (col) props.color = col
+  const fonts = rPr["w:rFonts"]
+  if (fonts && typeof fonts === "object") {
+    const font = fonts["@_w:eastAsia"] ?? fonts["@_w:ascii"] ?? fonts["@_w:hAnsi"]
+    if (typeof font === "string" && font) props.font = font
+  }
+
+  return props
+}
+
+function parseParaAlignmentFromObj(pPr: any): "left" | "center" | "right" | "justify" | undefined {
+  const v = pPr?.["w:jc"]?.["@_w:val"]
+  return normalizeAlignment(v)
+}
+
+function detectHeadingLevel(styleId: string | undefined, styleName: string | undefined): 1 | 2 | 3 | 4 | 5 | 6 | undefined {
+  const s = String(styleId ?? styleName ?? "").toLowerCase()
+  if (!s) return undefined
+  const m = s.match(/heading\s*([1-6])/i) || s.match(/heading_([1-6])/i) || s.match(/heading([1-6])/i)
+  if (!m) return undefined
+  const n = Number.parseInt(m[1]!, 10)
+  if (n >= 1 && n <= 6) return n as any
+  return undefined
+}
+
+function mergeDefined<T extends Record<string, any>>(...parts: Array<T | undefined>): T {
+  const out: any = {}
+  for (const p of parts) {
+    if (!p) continue
+    for (const [k, v] of Object.entries(p)) {
+      if (v !== undefined) out[k] = v
+    }
+  }
+  return out
+}
+
+// 解析图片/图形
+function parseDrawingNode(drawingNode: OrderedXmlNode, hyperlinkRels: Map<string, string>): ImageSpec[] {
+  const images: ImageSpec[] = []
+  
+  // 处理 w:drawing (现代图片格式)
+  const inlineNodes = childrenNamed(drawingNode, "wp:inline")
+  const anchorNodes = childrenNamed(drawingNode, "wp:anchor")
+  
+  for (const node of [...inlineNodes, ...anchorNodes]) {
+    const graphicNode = childOf(node, "a:graphic")
+    if (!graphicNode) continue
     
-    // 段落 2: 副标题 - 22pt, 居中, 灰色, 微软雅黑（3个 run，需要合并处理）
-    { 
-      text: "调研纪要 / serve测试样例", 
-      fontSize: 11,  // 22/2
-      alignment: "center", 
-      bold: false, 
-      italic: false,
-      color: "C0C0C0",
-      font: "微软雅黑"
-    },
+    const graphicDataNode = childOf(graphicNode, "a:graphicData")
+    if (!graphicDataNode) continue
     
-    // 段落 3: 生成时间 - 22pt, 居中, 灰色, 微软雅黑
-    { 
-      text: "生成时间：2024-01-01 00:00:00", 
-      fontSize: 11,  // 22/2
-      alignment: "center", 
-      bold: false, 
-      italic: false,
-      color: "C0C0C0",
-      font: "微软雅黑"
-    },
+    const picNode = childOf(graphicDataNode, "pic:pic")
+    if (!picNode) continue
     
-    // 段落 4: 空行
-    { text: "", alignment: "center" },
+    const blipFillNode = childOf(picNode, "pic:blipFill")
+    const blipNode = blipFillNode ? childOf(blipFillNode, "a:blip") : undefined
+    const embedId = blipNode ? attrOf(attrsOf(blipNode), "r:embed") : undefined
     
-    // 段落 5: 摘要标题 - 22pt, 粗体, 黑色, 微软雅黑
-    { 
-      text: "摘要", 
-      fontSize: 11,  // 22/2
-      bold: true, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑"
-    },
+    const spPrNode = childOf(picNode, "pic:spPr")
+    const xfrmNode = spPrNode ? childOf(spPrNode, "a:xfrm") : undefined
+    const extNode = xfrmNode ? childOf(xfrmNode, "a:ext") : undefined
     
-    // 段落 6: 摘要内容 - 22pt, 普通, 黑色, 微软雅黑
-    { 
-      text: 'AI 应用正从"单点助手"走向"流程自动化 + 业务闭环"。落地优先级应围绕高频流程、数据可得、风险可控与指标可量化来排序。', 
-      fontSize: 11,  // 22/2
-      bold: false, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑"
-    },
+    const cxRaw = extNode ? Number.parseInt(String(attrOf(attrsOf(extNode), "cx") ?? ""), 10) : NaN
+    const cyRaw = extNode ? Number.parseInt(String(attrOf(attrsOf(extNode), "cy") ?? ""), 10) : NaN
     
-    // 段落 7: 摘要内容续 - 22pt, 普通, 黑色, 微软雅黑
-    { 
-      text: "本文档为样例内容：用于测试流式写入时对段落、列表、表格、超链接、页眉页脚等样式要素的还原。", 
-      fontSize: 11,  // 22/2
-      bold: false, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑"
-    },
+    const nvPicPrNode = childOf(picNode, "pic:nvPicPr")
+    const cNvPrNode = nvPicPrNode ? childOf(nvPicPrNode, "pic:cNvPr") : undefined
+    const descr = cNvPrNode ? attrOf(attrsOf(cNvPrNode), "descr") : undefined
+    const title = cNvPrNode ? attrOf(attrsOf(cNvPrNode), "title") : undefined
     
-    // 段落 8: 空行
-    { text: "" },
+    images.push({
+      type: "image",
+      relationshipId: typeof embedId === "string" ? embedId : undefined,
+      width: Number.isFinite(cxRaw) ? cxRaw / 914400 * 72 : undefined, // EMU to points
+      height: Number.isFinite(cyRaw) ? cyRaw / 914400 * 72 : undefined,
+      description: typeof descr === "string" ? descr : undefined,
+      title: typeof title === "string" ? title : undefined
+    })
+  }
+  
+  return images
+}
+
+// 解析旧版图片 (v:shape, w:pict)
+function parsePictNode(pictNode: OrderedXmlNode): ImageSpec[] {
+  const images: ImageSpec[] = []
+  
+  // 简化处理：提取基本信息
+  const shapeNodes = childrenNamed(pictNode, "v:shape")
+  for (const shapeNode of shapeNodes) {
+    const imageDataNodes = childrenNamed(shapeNode, "v:imagedata")
+    for (const imgNode of imageDataNodes) {
+      const attrs = attrsOf(imgNode)
+      const rid = attrOf(attrs, "r:id")
+      const title = attrOf(attrs, "o:title")
+      
+      images.push({
+        type: "image",
+        relationshipId: typeof rid === "string" ? rid : undefined,
+        title: typeof title === "string" ? title : undefined
+      })
+    }
+  }
+  
+  return images
+}
+
+// 解析书签
+function parseBookmarkNodes(pNode: OrderedXmlNode): BookmarkSpec[] {
+  const bookmarks: BookmarkSpec[] = []
+  
+  for (const c of childrenOf(pNode)) {
+    const tn = tagNameOf(c)
+    const attrs = attrsOf(c)
     
-    // 段落 9: 第一章节标题 - 26pt, 粗体, 黑色, 微软雅黑
-    { 
-      text: "1  发展趋势与落地要点", 
-      fontSize: 13,  // 26/2
-      bold: true, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑",
-      headingLevel: 2
-    },
+    if (tn === "w:bookmarkStart") {
+      const id = String(attrOf(attrs, "w:id") ?? "")
+      const name = String(attrOf(attrs, "w:name") ?? "")
+      if (id) bookmarks.push({ id, name, type: "start" })
+    } else if (tn === "w:bookmarkEnd") {
+      const id = String(attrOf(attrs, "w:id") ?? "")
+      if (id) bookmarks.push({ id, name: "", type: "end" })
+    }
+  }
+  
+  return bookmarks
+}
+
+// 解析域代码（字段）
+function parseFieldNodes(pNode: OrderedXmlNode): FieldSpec[] {
+  const fields: FieldSpec[] = []
+  
+  // 简单域 (w:fldSimple)
+  for (const c of childrenOf(pNode)) {
+    if (tagNameOf(c) === "w:fldSimple") {
+      const attrs = attrsOf(c)
+      const instr = String(attrOf(attrs, "w:instr") ?? "")
+      const text = textFromOrdered(c)
+      
+      fields.push({
+        type: "field",
+        code: instr,
+        result: text,
+        fieldType: detectFieldType(instr)
+      })
+    }
+  }
+  
+  // 复杂域 (w:fldChar) - 需要状态机解析
+  let inField = false
+  let fieldCode = ""
+  let fieldResult = ""
+  
+  for (const rNode of childrenNamed(pNode, "w:r")) {
+    for (const c of childrenOf(rNode)) {
+      const tn = tagNameOf(c)
+      
+      if (tn === "w:fldChar") {
+        const fldCharType = String(attrOf(attrsOf(c), "w:fldCharType") ?? "")
+        if (fldCharType === "begin") {
+          inField = true
+          fieldCode = ""
+          fieldResult = ""
+        } else if (fldCharType === "separate") {
+          // 开始收集结果
+        } else if (fldCharType === "end") {
+          if (inField) {
+            fields.push({
+              type: "field",
+              code: fieldCode.trim(),
+              result: fieldResult.trim(),
+              fieldType: detectFieldType(fieldCode)
+            })
+          }
+          inField = false
+        }
+      } else if (tn === "w:instrText") {
+        if (inField) fieldCode += textFromOrdered(c)
+      } else if (tn === "w:t") {
+        if (inField && fieldCode) fieldResult += textFromOrdered(c)
+      }
+    }
+  }
+  
+  return fields
+}
+
+function detectFieldType(code: string): FieldSpec["fieldType"] {
+  const c = code.trim().toUpperCase()
+  if (c.startsWith("TOC")) return "toc"
+  if (c.startsWith("PAGEREF")) return "pageref"
+  if (c.startsWith("REF")) return "ref"
+  if (c.startsWith("HYPERLINK")) return "hyperlink"
+  if (c.startsWith("DATE")) return "date"
+  if (c.startsWith("TIME")) return "time"
+  if (c.startsWith("=")) return "formula"
+  return "other"
+}
+
+// 解析注释标记
+function parseCommentNodes(pNode: OrderedXmlNode): CommentSpec[] {
+  const comments: CommentSpec[] = []
+  
+  for (const c of childrenOf(pNode)) {
+    const tn = tagNameOf(c)
+    const attrs = attrsOf(c)
     
-    // 段落 10-13: 正文 - 22pt, 普通, 黑色, 微软雅黑
-    { text: "从产品形态看，落地会经历三个阶段：", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "信息增强：检索、摘要、改写、结构化输出。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "任务协作：在工单、文档、审批等流程中协助执行。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "流程闭环：引入评估、权限、审计与运营机制，实现持续优化。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
+    if (tn === "w:commentRangeStart") {
+      const id = String(attrOf(attrs, "w:id") ?? "")
+      if (id) comments.push({ id, rangeType: "start" })
+    } else if (tn === "w:commentRangeEnd") {
+      const id = String(attrOf(attrs, "w:id") ?? "")
+      if (id) comments.push({ id, rangeType: "end" })
+    }
+  }
+  
+  return comments
+}
+
+// 解析脚注/尾注引用
+function parseNoteReferences(pNode: OrderedXmlNode): NoteSpec[] {
+  const notes: NoteSpec[] = []
+  
+  for (const rNode of childrenNamed(pNode, "w:r")) {
+    for (const c of childrenOf(rNode)) {
+      const tn = tagNameOf(c)
+      const attrs = attrsOf(c)
+      
+      if (tn === "w:footnoteReference") {
+        const id = String(attrOf(attrs, "w:id") ?? "")
+        if (id) notes.push({ type: "footnote", id })
+      } else if (tn === "w:endnoteReference") {
+        const id = String(attrOf(attrs, "w:id") ?? "")
+        if (id) notes.push({ type: "endnote", id })
+      }
+    }
+  }
+  
+  return notes
+}
+
+// 解析数学公式 (OMML)
+function parseMathNodes(pNode: OrderedXmlNode): MathSpec[] {
+  const maths: MathSpec[] = []
+  
+  for (const c of childrenOf(pNode)) {
+    if (tagNameOf(c) === "m:oMath" || tagNameOf(c) === "m:oMathPara") {
+      // 简化：保存原始 XML
+      const builder = new XMLBuilder({ ignoreAttributes: false, preserveOrder: true, format: false })
+      const omml = builder.build([c])
+      maths.push({ type: "math", omml })
+    }
+  }
+  
+  return maths
+}
+
+function resolveStyleChain(styleId: string | undefined, styles: StyleMap, kind: "run" | "para", visited = new Set<string>()): any {
+  if (!styleId) return {}
+  if (visited.has(styleId)) return {}
+  visited.add(styleId)
+  const s = styles.get(styleId)
+  if (!s) return {}
+  const base = resolveStyleChain(s.basedOn, styles, kind, visited)
+  const own = kind === "run" ? (s.run ?? {}) : (s.para ?? {})
+  return mergeDefined(base, own)
+}
+
+async function readZipEntry(docxBuffer: Buffer, entryName: string): Promise<Buffer | undefined> {
+  const require = createRequire(import.meta.url)
+  const yauzl = require("yauzl") as typeof import("yauzl")
+
+  return await new Promise((resolve, reject) => {
+    yauzl.fromBuffer(docxBuffer, { lazyEntries: true }, (err: Error | null, zipfile?: ZipFile) => {
+      if (err || !zipfile) {
+        reject(err ?? new Error("zip_open_failed"))
+        return
+      }
+
+      let done = false
+
+      const finish = (result: Buffer | undefined) => {
+        if (done) return
+        done = true
+        zipfile.close()
+        resolve(result)
+      }
+
+      zipfile.readEntry()
+      zipfile.on("entry", (entry: Entry) => {
+        if (entry.fileName !== entryName) {
+          zipfile.readEntry()
+          return
+        }
+        zipfile.openReadStream(entry, (err2: Error | null, stream?: Readable) => {
+          if (err2 || !stream) {
+            reject(err2 ?? new Error("zip_entry_stream_failed"))
+            return
+          }
+          const chunks: Buffer[] = []
+          stream.on("data", (c: Buffer) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)))
+          stream.on("end", () => finish(Buffer.concat(chunks)))
+          stream.on("error", reject)
+        })
+      })
+      zipfile.on("end", () => finish(undefined))
+      zipfile.on("error", reject)
+    })
+  })
+}
+
+// 解析 numbering.xml 获取编号格式定义
+function parseNumbering(xml: string): Map<string, Map<number, { format?: string; text?: string }>> {
+  const parser = new XMLParser({ ignoreAttributes: false })
+  const obj: any = parser.parse(xml)
+  const numberingRoot = obj?.["w:numbering"]
+  
+  const abstractNums = new Map<string, Map<number, { format?: string; text?: string }>>()
+  const numMap = new Map<string, string>() // numId -> abstractNumId
+  
+  // 解析抽象编号定义
+  for (const abstractNum of asArray<any>(numberingRoot?.["w:abstractNum"])) {
+    const abstractNumId = String(abstractNum?.["@_w:abstractNumId"] ?? "")
+    if (!abstractNumId) continue
     
-    // 段落 14: 空行
-    { text: "" },
+    const levels = new Map<number, { format?: string; text?: string }>()
     
-    // 段落 15-18: 正文 - 22pt, 普通, 黑色, 微软雅黑
-    { text: "落地方法建议：", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "选择高频流程：明确输入、输出与验收标准。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "建立数据与权限：保证可用性与合规性。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: "设置评估指标：上线前后都能量化效果。", fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
+    for (const lvl of asArray<any>(abstractNum?.["w:lvl"])) {
+      const ilvl = Number.parseInt(String(lvl?.["@_w:ilvl"] ?? ""), 10)
+      if (!Number.isFinite(ilvl)) continue
+      
+      const numFmt = lvl?.["w:numFmt"]?.["@_w:val"]
+      const lvlText = lvl?.["w:lvlText"]?.["@_w:val"]
+      
+      levels.set(ilvl, {
+        format: typeof numFmt === "string" ? numFmt : undefined,
+        text: typeof lvlText === "string" ? lvlText : undefined
+      })
+    }
     
-    // 段落 19-20: 空行
-    { text: "" },
-    { text: "" },
-    
-    // 段落 21: 第二章节标题 - 26pt, 粗体, 黑色, 微软雅黑
-    { 
-      text: "2  典型落地场景（示例）", 
-      fontSize: 13,  // 26/2
-      bold: true, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑",
-      headingLevel: 2
-    },
-    
-    // 段落 22-25: 正文 - 22pt, 普通, 黑色, 微软雅黑
-    { text: '以下场景适合以"可控 + 可衡量"为优先目标：', fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: '知识检索与总结：面向内部知识库，强调引用与溯源。', fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: '客服质检与复盘：从对话中抽取要点，输出结构化结论。', fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    { text: '工单填单与分派：基于规则与历史数据降低重复劳动。', fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    
-    // 段落 26: 空行
-    { text: "" },
-    
-    // 段落 27: 参考链接标题 - 22pt, 普通, 灰色, 微软雅黑
-    { text: '参考链接：', fontSize: 11, bold: false, italic: false, color: "C0C0C0", font: "微软雅黑" },
-    
-    // 段落 28: 示例接口 - 20pt, 普通, 灰色, Consolas
-    { text: '示例接口：POST /v1/chat/completions', fontSize: 10, bold: false, italic: false, color: "C0C0C0", font: "Consolas" },
-    
-    // 段落 29: 空行
-    { text: "" },
-    
-    // 段落 30: 第三章节标题 - 26pt, 粗体, 黑色, 微软雅黑
-    { 
-      text: "3  指标与风险清单（示例）", 
-      fontSize: 13,  // 26/2
-      bold: true, 
-      italic: false,
-      color: "000000",
-      font: "微软雅黑",
-      headingLevel: 2
-    },
-    
-    // 段落 31: 表格说明 - 22pt, 普通, 黑色, 微软雅黑
-    { text: '表格用于测试：合并单元格、底纹、边框、字体一致性。', fontSize: 11, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-    
-    // 段落 32: 空行
-    { text: "" },
-    
-    // 表格 1: AI 应用落地评估表（精确还原真实样式）
-    // 根据 Python XML 解析：
-    // - 标题行：bold=true, italic=false (不是 italic=true!)
-    // - 表头行：bold=true, italic=false (不是 italic=true!)
-    // - 数据行：bold=false, italic=false (不是 bold=true, italic=true!)
-    // - 特殊单元格需要单独处理
-    {
+    abstractNums.set(abstractNumId, levels)
+  }
+  
+  // 解析编号实例
+  for (const num of asArray<any>(numberingRoot?.["w:num"])) {
+    const numId = String(num?.["@_w:numId"] ?? "")
+    const abstractNumId = String(num?.["w:abstractNumId"]?.["@_w:val"] ?? "")
+    if (numId && abstractNumId) {
+      numMap.set(numId, abstractNumId)
+    }
+  }
+  
+  // 构建最终映射：numId -> levels
+  const result = new Map<string, Map<number, { format?: string; text?: string }>>()
+  for (const [numId, abstractNumId] of numMap.entries()) {
+    const levels = abstractNums.get(abstractNumId)
+    if (levels) result.set(numId, levels)
+  }
+  
+  return result
+}
+
+async function readAllReadable(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+  return Buffer.concat(chunks)
+}
+
+async function replaceZipEntry(docxBuffer: Buffer, entryName: string, replacement: Buffer): Promise<Buffer> {
+  const require = createRequire(import.meta.url)
+  const yauzl = require("yauzl") as typeof import("yauzl")
+  const yazl = require("yazl") as typeof import("yazl")
+
+  const zipOut = new yazl.ZipFile()
+  const outPromise = readAllReadable(zipOut.outputStream as unknown as Readable)
+
+  await new Promise<void>((resolve, reject) => {
+    yauzl.fromBuffer(docxBuffer, { lazyEntries: true }, (err: Error | null, zipfile?: ZipFile) => {
+      if (err || !zipfile) {
+        reject(err ?? new Error("zip_open_failed"))
+        return
+      }
+
+      zipfile.readEntry()
+      zipfile.on("entry", (entry: Entry) => {
+        if (entry.fileName.endsWith("/")) {
+          zipOut.addEmptyDirectory(entry.fileName)
+          zipfile.readEntry()
+          return
+        }
+        zipfile.openReadStream(entry, async (err2: Error | null, stream?: Readable) => {
+          if (err2 || !stream) {
+            reject(err2 ?? new Error("zip_entry_stream_failed"))
+            return
+          }
+
+          try {
+            const data = entry.fileName === entryName ? replacement : await readAllReadable(stream)
+            zipOut.addBuffer(data, entry.fileName)
+            zipfile.readEntry()
+          } catch (e) {
+            reject(e)
+          }
+        })
+      })
+
+      zipfile.on("end", () => {
+        resolve()
+      })
+      zipfile.on("error", reject)
+    })
+  })
+
+  zipOut.end()
+  return await outPromise
+}
+
+function parseRelationships(xml: string): Map<string, string> {
+  const parser = new XMLParser({ ignoreAttributes: false })
+  const obj: any = parser.parse(xml)
+  const rels = obj?.Relationships?.Relationship
+  const out = new Map<string, string>()
+  for (const r of asArray<any>(rels)) {
+    const id = r?.["@_Id"]
+    const type = r?.["@_Type"]
+    const target = r?.["@_Target"]
+    if (typeof id === "string" && typeof target === "string" && typeof type === "string") {
+      if (type.includes("/hyperlink")) out.set(id, target)
+      // 扩展：支持图片、页眉页脚等关系
+      if (type.includes("/image")) out.set(id, target)
+      if (type.includes("/header")) out.set(id, target)
+      if (type.includes("/footer")) out.set(id, target)
+      if (type.includes("/footnotes")) out.set(id, target)
+      if (type.includes("/endnotes")) out.set(id, target)
+      if (type.includes("/comments")) out.set(id, target)
+    }
+  }
+  return out
+}
+
+function parseStyles(xml: string): { styles: StyleMap; docDefaultRun: Partial<RunStyle>; docDefaultPara: Pick<DocxParagraph, "alignment"> } {
+  const parser = new XMLParser({ ignoreAttributes: false, allowBooleanAttributes: true })
+  const obj: any = parser.parse(xml)
+  const stylesRoot = obj?.["w:styles"]
+
+  const styles: StyleMap = new Map()
+
+  const docDefaults = stylesRoot?.["w:docDefaults"]
+  const docDefaultRun = parseRunPropsFromObj(docDefaults?.["w:rPrDefault"]?.["w:rPr"])
+  const docDefaultPara = { alignment: parseParaAlignmentFromObj(docDefaults?.["w:pPrDefault"]?.["w:pPr"]) }
+
+  for (const st of asArray<any>(stylesRoot?.["w:style"])) {
+    const styleId = st?.["@_w:styleId"]
+    if (typeof styleId !== "string" || !styleId) continue
+
+    const name = st?.["w:name"]?.["@_w:val"]
+    const basedOn = st?.["w:basedOn"]?.["@_w:val"]
+    const type = st?.["@_w:type"]
+
+    const para = {
+      alignment: parseParaAlignmentFromObj(st?.["w:pPr"]),
+      headingLevel: detectHeadingLevel(styleId, name)
+    }
+
+    styles.set(styleId, {
+      type: typeof type === "string" ? type : undefined,
+      basedOn: typeof basedOn === "string" ? basedOn : undefined,
+      name: typeof name === "string" ? name : undefined,
+      run: parseRunPropsFromObj(st?.["w:rPr"]),
+      para
+    })
+  }
+
+  return { styles, docDefaultRun, docDefaultPara }
+}
+
+function buildParagraphFromRuns(
+  runs: RunStyle[],
+  paraInfo: { alignment?: "left" | "center" | "right" | "justify"; headingLevel?: 1 | 2 | 3 | 4 | 5 | 6; link?: string; spacing?: ParagraphSpacing }
+): DocxParagraph {
+  const text = runs.map((r) => r.text).join("")
+
+  const base: DocxParagraph = {
+    text,
+    alignment: paraInfo.alignment,
+    headingLevel: paraInfo.headingLevel,
+    link: paraInfo.link,
+    spacing: paraInfo.spacing,
+    runs: runs.length ? runs : undefined
+  }
+
+  if (runs.length) {
+    const keys: Array<keyof RunStyle> = ["bold", "italic", "underline", "fontSize", "color", "font"]
+    const first = runs[0]!
+    const uniform = keys.every((k) => runs.every((r) => r[k] === first[k]))
+    if (uniform) {
+      base.bold = first.bold
+      base.italic = first.italic
+      base.underline = first.underline
+      base.fontSize = first.fontSize
+      base.color = first.color
+      base.font = first.font
+    }
+  }
+
+  return base
+}
+
+function parseParagraphNode(
+  pNode: OrderedXmlNode,
+  styles: StyleMap,
+  docDefaultRun: Partial<RunStyle>,
+  docDefaultPara: Pick<DocxParagraph, "alignment">,
+  hyperlinkRels: Map<string, string>
+): DocxParagraph {
+  const pPr = childOf(pNode, "w:pPr")
+  const paraProps = parseParaPropsFromOrdered(pPr)
+
+  const paraStyleId = paraProps.paraStyleId
+  const paraStyleRun = resolveStyleChain(paraStyleId, styles, "run")
+  const paraStylePara = resolveStyleChain(paraStyleId, styles, "para")
+
+  const alignment = paraProps.alignment ?? paraStylePara.alignment ?? docDefaultPara.alignment
+  const headingLevel = paraStylePara.headingLevel
+  const spacing = paraProps.spacing
+  const numbering = paraProps.numbering
+  const indent = paraProps.indent
+
+  const runs: RunStyle[] = []
+  const hyperlinkTargetsInPara = new Set<string>()
+  const images: ImageSpec[] = []
+  const bookmarks: BookmarkSpec[] = []
+  const fields: FieldSpec[] = []
+  const notes: NoteSpec[] = []
+  const comments: CommentSpec[] = []
+
+  // 解析书签
+  bookmarks.push(...parseBookmarkNodes(pNode))
+  
+  // 解析注释标记
+  comments.push(...parseCommentNodes(pNode))
+  
+  // 解析脚注/尾注引用
+  notes.push(...parseNoteReferences(pNode))
+  
+  // 解析域代码
+  fields.push(...parseFieldNodes(pNode))
+
+  for (const c of childrenOf(pNode)) {
+    const tn = tagNameOf(c)
+    if (tn === "w:pPr") continue
+
+    // 解析超链接
+    if (tn === "w:hyperlink") {
+      const attrs = attrsOf(c)
+      const rid = attrOf(attrs, "r:id")
+      const href = typeof rid === "string" ? hyperlinkRels.get(rid) : undefined
+      if (href) hyperlinkTargetsInPara.add(href)
+
+      for (const hc of childrenOf(c)) {
+        if (tagNameOf(hc) === "w:r") {
+          const rr = parseRunNode(hc, styles, docDefaultRun, paraStyleRun, paraProps.runDefaults)
+          if (rr.text) runs.push(rr)
+        }
+      }
+      continue
+    }
+
+    // 解析普通 run
+    if (tn === "w:r") {
+      // 检查 run 中的图片
+      for (const rc of childrenOf(c)) {
+        const rctn = tagNameOf(rc)
+        if (rctn === "w:drawing") {
+          images.push(...parseDrawingNode(rc, hyperlinkRels))
+        } else if (rctn === "w:pict") {
+          images.push(...parsePictNode(rc))
+        }
+      }
+      
+      const rr = parseRunNode(c, styles, docDefaultRun, paraStyleRun, paraProps.runDefaults)
+      if (rr.text) runs.push(rr)
+      continue
+    }
+  }
+
+  const link = hyperlinkTargetsInPara.size === 1 ? [...hyperlinkTargetsInPara][0] : undefined
+
+  if (runs.length === 0) {
+    const effective = mergeDefined(docDefaultRun, paraStyleRun, paraProps.runDefaults)
+    const emptyRun: RunStyle = {
       text: "",
-      isTable: true,
-      tableData: [
-        ["AI 应用落地评估表（示例）"],  // 第1行只有1个单元格（合并4列）
-        ["场景", "价值指标", "数据/系统依赖", "风险与兜底"],
-        ["知识检索 + 摘要生成", "采纳率、节省工时、满意度", "知识库、权限、检索链路", "引用来源、低置信度提示、人工复核"],
-        ["工单自动分派/填单", "一次解决率、时延、转人工率", "工单系统、字段校验、流程规则", "规则兜底、审计、敏感信息脱敏"],
-        ["测试", "测试", "测试", "测试"]
-      ],
-      tableCellStyles: [
-        // 行1: 标题行 - 只有1个单元格，合并4列
-        // 真实样式：fontSize=22, bold=true, italic=false (不是 italic=true!)
-        [
-          { gridSpan: 4, fill: "808080", alignment: "center", fontSize: 11, bold: true, italic: false, color: "000000", font: "微软雅黑" }
-        ],
-        // 行2: 表头 - 灰色背景，左对齐，20pt，bold=true, italic=false (不是 italic=true!)
-        [
-          { fill: "808080", alignment: "left", fontSize: 10, bold: true, italic: false, color: "000000", font: "微软雅黑" },
-          { fill: "808080", alignment: "left", fontSize: 10, bold: true, italic: false, color: "000000", font: "微软雅黑" },
-          { fill: "808080", alignment: "left", fontSize: 10, bold: true, italic: false, color: "000000", font: "微软雅黑" },
-          { fill: "808080", alignment: "left", fontSize: 10, bold: true, italic: false, color: "000000", font: "微软雅黑" }
-        ],
-        // 行3: 数据行 - 20pt，bold=false, italic=false (不是 bold=true, italic=true!)
-        [
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" }
-        ],
-        // 行4: 数据行 - 20pt，bold=false, italic=false (不是 bold=true, italic=true!)
-        [
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" }
-        ],
-        // 行5: 测试行 - 混合样式（从 XML 精确提取）
-        [
-          { fontSize: 10, bold: false, italic: true, color: "000000", font: "微软雅黑" },  // 单元格1: 只斜体 (不是粗体+斜体!)
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },  // 单元格2: 普通
-          { fontSize: 10, bold: false, italic: false, color: "000000", font: "微软雅黑" },  // 单元格3: 普通
-          { fontSize: 22, bold: true, italic: false, color: "000000", font: "Lantinghei TC Demibold" }  // 单元格4: 44pt，粗体，特殊字体 (不是斜体!)
-        ]
-      ]
-    },
+      bold: effective.bold,
+      italic: effective.italic,
+      underline: effective.underline,
+      fontSize: effective.fontSize,
+      color: effective.color,
+      font: effective.font
+    }
+    const para = buildParagraphFromRuns([emptyRun], { alignment, headingLevel, link, spacing })
     
-    // 段落 33: 空行
-    { text: "" },
+    // 添加扩展属性
+    if (images.length) para.images = images
+    if (numbering) para.numbering = numbering
+    if (bookmarks.length) para.bookmarks = bookmarks
+    if (fields.length) para.fields = fields
+    if (notes.length) para.notes = notes
+    if (comments.length) para.comments = comments
+    if (indent) para.indent = indent
+    if (paraProps.keepNext) para.keepNext = paraProps.keepNext
+    if (paraProps.keepLines) para.keepLines = paraProps.keepLines
+    if (paraProps.pageBreakBefore) para.pageBreakBefore = paraProps.pageBreakBefore
+    if (paraProps.widowControl !== undefined) para.widowControl = paraProps.widowControl
+    if (paraProps.outlineLevel !== undefined) para.outlineLevel = paraProps.outlineLevel
+    if (paraStyleId) para.styleId = paraStyleId
     
-    // 表格 2: 第二页内容提示（灰色背景，包含3个段落）
-    // 真实样式：bold=false, italic=false (不是 bold=true, italic=true!)
-    {
-      text: "",
-      isTable: true,
-      tableData: [
-        ['— 以下为第二页内容 —\n\n提示：优先选择"可控性强、指标可量化、可快速闭环"的业务流程作为首批落地场景。']
-      ],
-      tableCellStyles: [
-        [{ 
-          fill: "808080", 
-          alignment: "left", 
-          fontSize: 11,  // 第一段22pt，第二段20pt，这里用平均值
-          bold: false,  // 不是 bold=true!
-          italic: false,  // 不是 italic=true!
-          color: "C0C0C0", 
-          font: "微软雅黑",
-          verticalAlign: "top"
-        }]
-      ]
-    },
+    return para
+  }
+
+  const para = buildParagraphFromRuns(runs, { alignment, headingLevel, link, spacing })
+  
+  // 添加扩展属性
+  if (images.length) para.images = images
+  if (numbering) para.numbering = numbering
+  if (bookmarks.length) para.bookmarks = bookmarks
+  if (fields.length) para.fields = fields
+  if (notes.length) para.notes = notes
+  if (comments.length) para.comments = comments
+  if (indent) para.indent = indent
+  if (paraProps.keepNext) para.keepNext = paraProps.keepNext
+  if (paraProps.keepLines) para.keepLines = paraProps.keepLines
+  if (paraProps.pageBreakBefore) para.pageBreakBefore = paraProps.pageBreakBefore
+  if (paraProps.widowControl !== undefined) para.widowControl = paraProps.widowControl
+  if (paraProps.outlineLevel !== undefined) para.outlineLevel = paraProps.outlineLevel
+  if (paraStyleId) para.styleId = paraStyleId
+  
+  return para
+}
+
+function parseRunNode(
+  rNode: OrderedXmlNode,
+  styles: StyleMap,
+  docDefaultRun: Partial<RunStyle>,
+  paraStyleRun: Partial<RunStyle>,
+  paraRunDefaults: Partial<RunStyle> | undefined
+): RunStyle {
+  const rPr = childOf(rNode, "w:rPr")
+  const { props: direct, charStyleId } = parseRunPropsFromOrdered(rPr)
+  const charStyleRun = resolveStyleChain(charStyleId, styles, "run")
+
+  const effective = mergeDefined(docDefaultRun, paraStyleRun, paraRunDefaults, charStyleRun, direct)
+
+  const text = childrenOf(rNode)
+    .filter((c) => tagNameOf(c) !== "w:rPr")
+    .map(textFromOrdered)
+    .join("")
+
+  return {
+    text,
+    bold: effective.bold,
+    italic: effective.italic,
+    underline: effective.underline,
+    fontSize: effective.fontSize,
+    color: effective.color,
+    font: effective.font
+  }
+}
+
+function parseBorderSpecFromNode(n: OrderedXmlNode | undefined): BorderSpec | undefined {
+  if (!n) return undefined
+  const attrs = attrsOf(n)
+  const styleRaw = String(attrOf(attrs, "w:val") ?? "").trim().toLowerCase()
+  const sizeRaw = Number.parseInt(String(attrOf(attrs, "w:sz") ?? ""), 10)
+  const colorRaw = normalizeBorderColor(attrOf(attrs, "w:color"))
+
+  const out: BorderSpec = {}
+  if (styleRaw) out.style = styleRaw
+  if (Number.isFinite(sizeRaw)) out.size = sizeRaw
+  if (colorRaw) out.color = colorRaw
+  return Object.keys(out).length ? out : undefined
+}
+
+function parseTableBordersFromNode(bordersNode: OrderedXmlNode | undefined): TableBordersSpec | undefined {
+  if (!bordersNode) return undefined
+  const out: TableBordersSpec = {
+    top: parseBorderSpecFromNode(childOf(bordersNode, "w:top")),
+    bottom: parseBorderSpecFromNode(childOf(bordersNode, "w:bottom")),
+    left: parseBorderSpecFromNode(childOf(bordersNode, "w:left")),
+    right: parseBorderSpecFromNode(childOf(bordersNode, "w:right")),
+    insideHorizontal: parseBorderSpecFromNode(childOf(bordersNode, "w:insideH")),
+    insideVertical: parseBorderSpecFromNode(childOf(bordersNode, "w:insideV"))
+  }
+  return Object.values(out).some((v) => v != null) ? out : undefined
+}
+
+function parseCellBordersFromNode(bordersNode: OrderedXmlNode | undefined): CellBordersSpec | undefined {
+  if (!bordersNode) return undefined
+  const out: CellBordersSpec = {
+    top: parseBorderSpecFromNode(childOf(bordersNode, "w:top")),
+    bottom: parseBorderSpecFromNode(childOf(bordersNode, "w:bottom")),
+    left: parseBorderSpecFromNode(childOf(bordersNode, "w:left")),
+    right: parseBorderSpecFromNode(childOf(bordersNode, "w:right"))
+  }
+  return Object.values(out).some((v) => v != null) ? out : undefined
+}
+
+function parseSectionPropertiesFromSectPr(sectPr: OrderedXmlNode | undefined): SectionPropertiesSpec | undefined {
+  if (!sectPr) return undefined
+
+  const pgSz = childOf(sectPr, "w:pgSz")
+  const pgMar = childOf(sectPr, "w:pgMar")
+  const cols = childOf(sectPr, "w:cols")
+
+  const sizeAttrs = pgSz ? attrsOf(pgSz) : undefined
+  const widthRaw = sizeAttrs ? Number.parseInt(String(attrOf(sizeAttrs, "w:w") ?? ""), 10) : NaN
+  const heightRaw = sizeAttrs ? Number.parseInt(String(attrOf(sizeAttrs, "w:h") ?? ""), 10) : NaN
+  const orientRaw = sizeAttrs ? String(attrOf(sizeAttrs, "w:orient") ?? "").trim().toLowerCase() : ""
+  const orientation: "portrait" | "landscape" | undefined =
+    orientRaw === "landscape" ? "landscape" : orientRaw === "portrait" ? "portrait" : undefined
+
+  const marAttrs = pgMar ? attrsOf(pgMar) : undefined
+  const topRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:top") ?? ""), 10) : NaN
+  const rightRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:right") ?? ""), 10) : NaN
+  const bottomRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:bottom") ?? ""), 10) : NaN
+  const leftRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:left") ?? ""), 10) : NaN
+  const headerRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:header") ?? ""), 10) : NaN
+  const footerRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:footer") ?? ""), 10) : NaN
+  const gutterRaw = marAttrs ? Number.parseInt(String(attrOf(marAttrs, "w:gutter") ?? ""), 10) : NaN
+
+  const colsAttrs = cols ? attrsOf(cols) : undefined
+  const colCountRaw = colsAttrs ? Number.parseInt(String(attrOf(colsAttrs, "w:num") ?? ""), 10) : NaN
+  const colSpaceRaw = colsAttrs ? Number.parseInt(String(attrOf(colsAttrs, "w:space") ?? ""), 10) : NaN
+
+  const page: SectionPropertiesSpec["page"] = {}
+  const size: NonNullable<SectionPropertiesSpec["page"]>["size"] = {}
+  if (Number.isFinite(widthRaw)) size.width = widthRaw
+  if (Number.isFinite(heightRaw)) size.height = heightRaw
+  if (orientation) size.orientation = orientation
+  if (Object.keys(size).length) page.size = size
+
+  const margin: NonNullable<SectionPropertiesSpec["page"]>["margin"] = {}
+  if (Number.isFinite(topRaw)) margin.top = topRaw
+  if (Number.isFinite(rightRaw)) margin.right = rightRaw
+  if (Number.isFinite(bottomRaw)) margin.bottom = bottomRaw
+  if (Number.isFinite(leftRaw)) margin.left = leftRaw
+  if (Number.isFinite(headerRaw)) margin.header = headerRaw
+  if (Number.isFinite(footerRaw)) margin.footer = footerRaw
+  if (Number.isFinite(gutterRaw)) margin.gutter = gutterRaw
+  if (Object.keys(margin).length) page.margin = margin
+
+  const out: SectionPropertiesSpec = {}
+  if (Object.keys(page).length) out.page = page
+  if (Number.isFinite(colCountRaw) || Number.isFinite(colSpaceRaw)) {
+    const column: SectionPropertiesSpec["column"] = {}
+    if (Number.isFinite(colCountRaw)) column.count = colCountRaw
+    if (Number.isFinite(colSpaceRaw)) column.space = colSpaceRaw
+    out.column = column
+  }
+
+  return Object.keys(out).length ? out : undefined
+}
+
+function parseTableNode(
+  tblNode: OrderedXmlNode,
+  styles: StyleMap,
+  docDefaultRun: Partial<RunStyle>,
+  docDefaultPara: Pick<DocxParagraph, "alignment">,
+  hyperlinkRels: Map<string, string>
+): DocxParagraph {
+  const tblPr = childOf(tblNode, "w:tblPr")
+  const tblLayoutNode = tblPr ? childOf(tblPr, "w:tblLayout") : undefined
+  const layoutTypeRaw = tblLayoutNode ? String(attrOf(attrsOf(tblLayoutNode), "w:type") ?? "").trim().toLowerCase() : ""
+  const tableLayout: "fixed" | "autofit" | undefined = layoutTypeRaw === "fixed" ? "fixed" : layoutTypeRaw === "autofit" ? "autofit" : undefined
+
+  const tblBordersNode = tblPr ? childOf(tblPr, "w:tblBorders") : undefined
+  const tableBorders = parseTableBordersFromNode(tblBordersNode)
+
+  const tblGrid = childOf(tblNode, "w:tblGrid")
+  const tableGridColsRaw = tblGrid
+    ? childrenNamed(tblGrid, "w:gridCol").map((col) => Number.parseInt(String(attrOf(attrsOf(col), "w:w") ?? ""), 10))
+    : []
+  const tableGridCols = tableGridColsRaw.length ? tableGridColsRaw.filter((n) => Number.isFinite(n) && n > 0) : undefined
+
+  const trs = childrenNamed(tblNode, "w:tr")
+  const colCountFromGrid = tableGridCols?.length
+
+  let maxCols = typeof colCountFromGrid === "number" && colCountFromGrid > 0 ? colCountFromGrid : 0
+  if (maxCols === 0) {
+    for (const tr of trs) {
+      const trPr = childOf(tr, "w:trPr")
+      const gridBeforeNode = trPr ? childOf(trPr, "w:gridBefore") : undefined
+      const gridAfterNode = trPr ? childOf(trPr, "w:gridAfter") : undefined
+      const gridBefore = Number.parseInt(String(attrOf(attrsOf(gridBeforeNode ?? {}), "w:val") ?? ""), 10)
+      const gridAfter = Number.parseInt(String(attrOf(attrsOf(gridAfterNode ?? {}), "w:val") ?? ""), 10)
+      let cols = 0
+      if (Number.isFinite(gridBefore)) cols += gridBefore
+      for (const tc of childrenNamed(tr, "w:tc")) {
+        const tcPr = childOf(tc, "w:tcPr")
+        const gridSpanNode = tcPr ? childOf(tcPr, "w:gridSpan") : undefined
+        const spanRaw = Number.parseInt(String(attrOf(attrsOf(gridSpanNode ?? {}), "w:val") ?? ""), 10)
+        cols += Number.isFinite(spanRaw) && spanRaw > 0 ? spanRaw : 1
+      }
+      if (Number.isFinite(gridAfter)) cols += gridAfter
+      if (cols > maxCols) maxCols = cols
+    }
+  }
+
+  const rows: string[][] = []
+  const cellStyles: CellStyle[][] = []
+
+  const mergeTracker = new Map<string, CellStyle>()
+
+  for (const tr of trs) {
+    const rowTexts = new Array(maxCols).fill("")
+    const rowStyles = new Array(maxCols).fill(undefined).map(() => ({} as CellStyle))
+
+    const trPr = childOf(tr, "w:trPr")
+    const gridBeforeNode = trPr ? childOf(trPr, "w:gridBefore") : undefined
+    const gridAfterNode = trPr ? childOf(trPr, "w:gridAfter") : undefined
+    const gridBefore = Number.parseInt(String(attrOf(attrsOf(gridBeforeNode ?? {}), "w:val") ?? ""), 10)
+    const gridAfter = Number.parseInt(String(attrOf(attrsOf(gridAfterNode ?? {}), "w:val") ?? ""), 10)
+
+    const occupied = new Array(maxCols).fill(false)
+    for (const [key, top] of mergeTracker.entries()) {
+      const [colStartStr, spanStr] = key.split(":")
+      const colStart = Number.parseInt(colStartStr ?? "", 10)
+      const span = Number.parseInt(spanStr ?? "", 10)
+      if (!Number.isFinite(colStart) || !Number.isFinite(span)) continue
+      for (let c = colStart; c < Math.min(maxCols, colStart + span); c += 1) occupied[c] = true
+      if (rowStyles[colStart]) rowStyles[colStart].skip = true
+      for (let c = colStart + 1; c < Math.min(maxCols, colStart + span); c += 1) {
+        if (rowStyles[c]) rowStyles[c].skip = true
+      }
+    }
+
+    const beforeCols = Number.isFinite(gridBefore) && gridBefore > 0 ? gridBefore : 0
+    for (let c = 0; c < Math.min(maxCols, beforeCols); c += 1) {
+      occupied[c] = true
+      rowStyles[c].skip = true
+    }
+
+    let colCursor = beforeCols
+
+    for (const tc of childrenNamed(tr, "w:tc")) {
+      while (colCursor < maxCols && occupied[colCursor]) colCursor += 1
+      if (colCursor >= maxCols) break
+
+      const tcPr = childOf(tc, "w:tcPr")
+      const shading = tcPr ? childOf(tcPr, "w:shd") : undefined
+      const tcBordersNode = tcPr ? childOf(tcPr, "w:tcBorders") : undefined
+      const gridSpanNode = tcPr ? childOf(tcPr, "w:gridSpan") : undefined
+      const vAlign = tcPr ? childOf(tcPr, "w:vAlign") : undefined
+      const vMerge = tcPr ? childOf(tcPr, "w:vMerge") : undefined
+
+      const fill = shading ? normalizeColor(attrOf(attrsOf(shading), "w:fill")) : undefined
+      const borders = parseCellBordersFromNode(tcBordersNode)
+      const spanRaw = Number.parseInt(String(attrOf(attrsOf(gridSpanNode ?? {}), "w:val") ?? ""), 10)
+      const span = Number.isFinite(spanRaw) && spanRaw > 0 ? spanRaw : 1
+      const verticalVal = vAlign ? String(attrOf(attrsOf(vAlign), "w:val") ?? "").trim().toLowerCase() : ""
+      const vMergeValRaw = vMerge ? attrOf(attrsOf(vMerge), "w:val") : undefined
+      const vMergeVal = vMerge ? String(vMergeValRaw ?? "").trim().toLowerCase() : undefined
+
+      const colStart = colCursor
+      const colEnd = Math.min(maxCols, colStart + span)
+      for (let c = colStart; c < colEnd; c += 1) occupied[c] = true
+
+      const mergeKey = `${colStart}:${span}`
+
+      if (vMerge != null && vMergeVal !== "restart") {
+        const top = mergeTracker.get(mergeKey)
+        if (top) {
+          top.rowSpan = (top.rowSpan ?? 1) + 1
+        }
+        rowStyles[colStart].skip = true
+        for (let c = colStart + 1; c < colEnd; c += 1) rowStyles[c].skip = true
+        colCursor = colEnd
+        continue
+      }
+
+      mergeTracker.delete(mergeKey)
+
+      const paras = childrenNamed(tc, "w:p").map((p) =>
+        parseParagraphNode(p, styles, docDefaultRun, docDefaultPara, hyperlinkRels)
+      )
+
+      const cellText = paras.map((p) => p.text).join("\n")
+      rowTexts[colStart] = cellText
+
+      const firstRun = paras.find((p) => p.runs?.length)?.runs?.[0]
+      const style: CellStyle = {
+        fill,
+        gridSpan: span > 1 ? span : undefined,
+        colIndex: colStart,
+        verticalAlign:
+          verticalVal === "center" ? "center" : verticalVal === "bottom" ? "bottom" : verticalVal ? "top" : undefined,
+        alignment: paras.find((p) => p.alignment)?.alignment,
+        borders
+      }
+
+      if (firstRun) {
+        style.bold = firstRun.bold
+        style.italic = firstRun.italic
+        style.fontSize = firstRun.fontSize
+        style.color = firstRun.color
+        style.font = firstRun.font
+      }
+
+      if (vMergeVal === "restart") {
+        style.rowSpan = 1
+        mergeTracker.set(mergeKey, style)
+      }
+
+      rowStyles[colStart] = style
+      for (let c = colStart + 1; c < colEnd; c += 1) rowStyles[c] = { skip: true }
+
+      colCursor = colEnd
+    }
+
+    const afterCols = Number.isFinite(gridAfter) && gridAfter > 0 ? gridAfter : 0
+    if (afterCols > 0) {
+      const start = Math.max(0, maxCols - afterCols)
+      for (let c = start; c < maxCols; c += 1) {
+        rowStyles[c].skip = true
+      }
+    }
+
+    rows.push(rowTexts)
+    cellStyles.push(rowStyles)
+  }
+
+  return { text: "", isTable: true, tableData: rows, tableCellStyles: cellStyles, tableLayout, tableGridCols, tableBorders }
+}
+
+export async function extractParagraphsFromDocx(docxBuffer: Buffer): Promise<DocxParagraph[]> {
+  if (!docxBuffer || docxBuffer.length === 0) return []
+
+  const [stylesXmlBuf, documentXmlBuf, relsBuf, numberingXmlBuf, commentsXmlBuf, footnotesXmlBuf, endnotesXmlBuf] = await Promise.all([
+    readZipEntry(docxBuffer, "word/styles.xml"),
+    readZipEntry(docxBuffer, "word/document.xml"),
+    readZipEntry(docxBuffer, "word/_rels/document.xml.rels"),
+    readZipEntry(docxBuffer, "word/numbering.xml"),
+    readZipEntry(docxBuffer, "word/comments.xml"),
+    readZipEntry(docxBuffer, "word/footnotes.xml"),
+    readZipEntry(docxBuffer, "word/endnotes.xml")
+  ])
+
+  if (!documentXmlBuf) return []
+
+  const { styles, docDefaultRun, docDefaultPara } = stylesXmlBuf
+    ? parseStyles(stylesXmlBuf.toString("utf-8"))
+    : { styles: new Map(), docDefaultRun: {}, docDefaultPara: { alignment: undefined } }
+
+  const hyperlinkRels = relsBuf ? parseRelationships(relsBuf.toString("utf-8")) : new Map()
+  
+  const numberingDefs = numberingXmlBuf ? parseNumbering(numberingXmlBuf.toString("utf-8")) : new Map()
+
+  const parser = new XMLParser({ ignoreAttributes: false, preserveOrder: true })
+  const ordered: any[] = parser.parse(documentXmlBuf.toString("utf-8"))
+
+  const docNode = ordered.find((n) => tagNameOf(n) === "w:document")
+  if (!docNode) return []
+  const bodyNode = childOf(docNode, "w:body")
+  if (!bodyNode) return []
+
+  const bodyChildren = childrenOf(bodyNode)
+
+  const outReversed: DocxParagraph[] = []
+  let currentSectPr: OrderedXmlNode | undefined
+
+  for (let i = bodyChildren.length - 1; i >= 0; i -= 1) {
+    const c = bodyChildren[i] as OrderedXmlNode
+    const tn = tagNameOf(c)
     
-    // 段落 34: WPS 开放平台 - 22pt, 普通, 微软雅黑
-    { text: "WPS 开放平台", fontSize: 11, bold: false, italic: false, font: "微软雅黑" },
+    if (tn === "w:sectPr") {
+      currentSectPr = c
+      continue
+    }
     
-    // 段落 35: 空行
-    { text: "" }
-  ]
+    if (tn === "w:p") {
+      const pPr = childOf(c, "w:pPr")
+      const s = pPr ? childOf(pPr, "w:sectPr") : undefined
+      if (s) currentSectPr = s
+      const para = parseParagraphNode(c, styles, docDefaultRun, docDefaultPara, hyperlinkRels)
+      
+      // 补充编号格式信息
+      if (para.numbering?.numId !== undefined) {
+        const numId = String(para.numbering.numId)
+        const level = para.numbering.level ?? 0
+        const levelDef = numberingDefs.get(numId)?.get(level)
+        if (levelDef) {
+          para.numbering.format = levelDef.format
+          para.numbering.text = levelDef.text
+        }
+      }
+      
+      const sectionProperties = parseSectionPropertiesFromSectPr(currentSectPr)
+      if (sectionProperties) para.sectionProperties = sectionProperties
+      outReversed.push(para)
+      continue
+    }
+    
+    if (tn === "w:tbl") {
+      const tbl = parseTableNode(c, styles, docDefaultRun, docDefaultPara, hyperlinkRels)
+      const sectionProperties = parseSectionPropertiesFromSectPr(currentSectPr)
+      if (sectionProperties) tbl.sectionProperties = sectionProperties
+      outReversed.push(tbl)
+      continue
+    }
+    
+    // 处理其他未识别的元素（保留为占位符）
+    // 这样可以保持文档结构的完整性
+    if (tn && tn !== "w:bookmarkStart" && tn !== "w:bookmarkEnd") {
+      // 创建一个占位段落来表示未解析的元素
+      const placeholder: DocxParagraph = {
+        text: `[未解析元素: ${tn}]`,
+        color: "999999",
+        italic: true,
+        fontSize: 9
+      }
+      outReversed.push(placeholder)
+    }
+  }
+
+  outReversed.reverse()
+  return outReversed
+}
+
+export async function createDocxFromSourceDocxSlice(sourceDocxBuffer: Buffer, bodyElementCount: number): Promise<Buffer> {
+  if (!sourceDocxBuffer || sourceDocxBuffer.length === 0) return Buffer.alloc(0)
+
+  const documentXmlBuf = await readZipEntry(sourceDocxBuffer, "word/document.xml")
+  if (!documentXmlBuf) return Buffer.alloc(0)
+
+  const parser = new XMLParser({ ignoreAttributes: false, preserveOrder: true })
+  const ordered: any[] = parser.parse(documentXmlBuf.toString("utf-8"))
+
+  const docNode = ordered.find((n) => tagNameOf(n) === "w:document")
+  if (!docNode) return Buffer.alloc(0)
+  const bodyNode = childOf(docNode, "w:body")
+  if (!bodyNode) return Buffer.alloc(0)
+
+  const bodyChildren = childrenOf(bodyNode)
+  const cloneNode = <T,>(v: T): T => JSON.parse(JSON.stringify(v)) as T
+
+  const findSectPrFromIndex = (startIndex: number): OrderedXmlNode | undefined => {
+    for (let i = Math.max(0, startIndex); i < bodyChildren.length; i += 1) {
+      const n = bodyChildren[i] as OrderedXmlNode
+      const tn = tagNameOf(n)
+      if (tn === "w:sectPr") return n
+      if (tn === "w:p") {
+        const pPr = childOf(n, "w:pPr")
+        const s = pPr ? childOf(pPr, "w:sectPr") : undefined
+        if (s) return s
+      }
+    }
+    return undefined
+  }
+
+  const newBodyChildren: OrderedXmlNode[] = []
+  let included = 0
+  let lastIncludedBodyIndex = -1
+  for (let i = 0; i < bodyChildren.length; i += 1) {
+    const n = bodyChildren[i] as OrderedXmlNode
+    const tn = tagNameOf(n)
+    if (tn === "w:sectPr") continue
+    newBodyChildren.push(n)
+    lastIncludedBodyIndex = i
+    if (tn === "w:p" || tn === "w:tbl") included += 1
+    if (included >= bodyElementCount) break
+  }
+  const sectPrForChunk = findSectPrFromIndex(lastIncludedBodyIndex)
+  if (sectPrForChunk) newBodyChildren.push(cloneNode(sectPrForChunk))
+
+  const bodyKey = "w:body"
+  bodyNode[bodyKey] = newBodyChildren
+
+  const builder = new XMLBuilder({ ignoreAttributes: false, preserveOrder: true, format: false })
+  const newDocumentXml = builder.build(ordered)
+
+  return await replaceZipEntry(sourceDocxBuffer, "word/document.xml", Buffer.from(newDocumentXml, "utf-8"))
 }
 
 /**
@@ -291,18 +1633,55 @@ export async function extractParagraphsFromDocx(_docxBuffer: Buffer): Promise<Do
 export async function createDocxFromParagraphs(paragraphs: DocxParagraph[]): Promise<Buffer> {
   const children: (Paragraph | Table)[] = []
 
+  const toDocxBorderStyle = (style: string | undefined) => {
+    const s = String(style ?? "").trim().toLowerCase()
+    if (!s || s === "single") return BorderStyle.SINGLE
+    if (s === "none" || s === "nil") return BorderStyle.NONE
+    if (s === "dotted") return BorderStyle.DOTTED
+    if (s === "dashed") return BorderStyle.DASHED
+    if (s === "double") return BorderStyle.DOUBLE
+    if (s === "thick") return BorderStyle.THICK
+    return BorderStyle.SINGLE
+  }
+
+  const toDocxBorder = (spec: BorderSpec | undefined): any => {
+    if (!spec) return undefined
+    const style = toDocxBorderStyle(spec.style)
+    const size = Number.isFinite(spec.size as number) ? (spec.size as number) : style === BorderStyle.NONE ? 0 : 4
+    const color = spec.color ? spec.color : "auto"
+    return { style, size, color }
+  }
+
   for (const para of paragraphs) {
     // 处理表格
     if (para.isTable && para.tableData) {
+      const widthTypeDxa = (WidthType as any).DXA ?? WidthType.PERCENTAGE
+      const gridCols = (para.tableGridCols ?? []).filter((n) => Number.isFinite(n) && n > 0)
+      const hasGrid = gridCols.length > 0
+      const totalGridWidth = hasGrid ? gridCols.reduce((a, b) => a + b, 0) : 0
+
       const tableRows = para.tableData.map((rowData, rowIndex) => {
-        const cells = rowData.map((cellText, cellIndex) => {
-          // 获取单元格样式
-          const cellStyle = para.tableCellStyles?.[rowIndex]?.[cellIndex] || {}
-          
-          // 处理单元格内的多行文本（保留换行符）
-          const cellLines = cellText.split('\n')
-          const cellParagraphs = cellLines.map((line, lineIndex) => {
-            const runOptions: IRunOptions = {
+        const cells: TableCell[] = []
+        const rowStyles = para.tableCellStyles?.[rowIndex] || []
+        const rowLen = Array.isArray(rowData) ? rowData.length : 0
+
+        for (let cellIndex = 0; cellIndex < rowLen; cellIndex += 1) {
+          const cellText = rowData[cellIndex]
+          const cellStyle = rowStyles[cellIndex] || {}
+          if (cellStyle.skip) continue
+
+          const paragraphAlignment =
+            cellStyle.alignment === "center"
+              ? AlignmentType.CENTER
+              : cellStyle.alignment === "right"
+              ? AlignmentType.RIGHT
+              : cellStyle.alignment === "justify"
+              ? ((AlignmentType as any).JUSTIFIED ?? (AlignmentType as any).BOTH ?? AlignmentType.LEFT)
+              : AlignmentType.LEFT
+
+          const lines = String(cellText ?? "").split("\n")
+          const cellRuns = lines.map((line, lineIndex) => {
+            const runOptions: any = {
               text: line,
               bold: cellStyle.bold ?? false,
               italics: cellStyle.italic ?? false,
@@ -310,54 +1689,89 @@ export async function createDocxFromParagraphs(paragraphs: DocxParagraph[]): Pro
               color: cellStyle.color,
               font: cellStyle.font ? { name: cellStyle.font } : undefined
             }
-            
-            const paragraphAlignment = 
-              cellStyle.alignment === "center" ? AlignmentType.CENTER :
-              cellStyle.alignment === "right" ? AlignmentType.RIGHT :
-              AlignmentType.LEFT
-            
-            return new Paragraph({
-              children: [new TextRun(runOptions)],
-              alignment: paragraphAlignment,
-              spacing: lineIndex > 0 ? { before: 100 } : undefined  // 行间距
-            })
+            if (lineIndex > 0) runOptions.break = 1
+            return new TextRun(runOptions as IRunOptions)
           })
-          
-          const cellOptions: any = {
-            children: cellParagraphs,
-            width: { size: 25, type: WidthType.PERCENTAGE },
-            verticalAlign: cellStyle.verticalAlign === "center" ? "center" : 
-                          cellStyle.verticalAlign === "bottom" ? "bottom" : "top"
+
+          const span = typeof cellStyle.gridSpan === "number" && cellStyle.gridSpan > 0 ? cellStyle.gridSpan : 1
+          const colIndex = typeof cellStyle.colIndex === "number" && cellStyle.colIndex >= 0 ? cellStyle.colIndex : cellIndex
+
+          let cellWidth: number | undefined
+          if (hasGrid) {
+            const seg = gridCols.slice(colIndex, colIndex + span)
+            const w = seg.reduce((a, b) => a + b, 0)
+            if (w > 0) cellWidth = w
           }
-          
-          // 背景色
+
+          const cellOptions: any = {
+            children: [
+              new Paragraph({
+                children: cellRuns,
+                alignment: paragraphAlignment
+              })
+            ],
+            verticalAlign:
+              cellStyle.verticalAlign === "center" ? "center" : cellStyle.verticalAlign === "bottom" ? "bottom" : "top"
+          }
+
+          if (cellWidth != null) {
+            cellOptions.width = { size: cellWidth, type: widthTypeDxa }
+          } else {
+            const denom = rowLen || 1
+            cellOptions.width = { size: Math.max(1, Math.floor(100 / denom)), type: WidthType.PERCENTAGE }
+          }
+
           if (cellStyle.fill) {
             cellOptions.shading = { fill: cellStyle.fill }
           }
-          
-          // 合并列
-          if (cellStyle.gridSpan) {
-            cellOptions.columnSpan = cellStyle.gridSpan
+
+          if (cellStyle.borders) {
+            const borders: any = {}
+            const top = toDocxBorder(cellStyle.borders.top)
+            const bottom = toDocxBorder(cellStyle.borders.bottom)
+            const left = toDocxBorder(cellStyle.borders.left)
+            const right = toDocxBorder(cellStyle.borders.right)
+            if (top) borders.top = top
+            if (bottom) borders.bottom = bottom
+            if (left) borders.left = left
+            if (right) borders.right = right
+            if (Object.keys(borders).length) cellOptions.borders = borders
           }
-          
-          return new TableCell(cellOptions)
-        })
+
+          if (span > 1) cellOptions.columnSpan = span
+          if (typeof cellStyle.rowSpan === "number" && cellStyle.rowSpan > 1) (cellOptions as any).rowSpan = cellStyle.rowSpan
+
+          cells.push(new TableCell(cellOptions))
+        }
 
         return new TableRow({ children: cells })
       })
 
+      const defaultBorders: any = {
+        top: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+        bottom: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+        left: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+        right: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+        insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
+        insideVertical: { style: BorderStyle.SINGLE, size: 1, color: "000000" }
+      }
+
+      const tableBorders: any = para.tableBorders
+        ? {
+            top: toDocxBorder(para.tableBorders.top) ?? defaultBorders.top,
+            bottom: toDocxBorder(para.tableBorders.bottom) ?? defaultBorders.bottom,
+            left: toDocxBorder(para.tableBorders.left) ?? defaultBorders.left,
+            right: toDocxBorder(para.tableBorders.right) ?? defaultBorders.right,
+            insideHorizontal: toDocxBorder(para.tableBorders.insideHorizontal) ?? defaultBorders.insideHorizontal,
+            insideVertical: toDocxBorder(para.tableBorders.insideVertical) ?? defaultBorders.insideVertical
+          }
+        : defaultBorders
+
       children.push(
         new Table({
           rows: tableRows,
-          width: { size: 100, type: WidthType.PERCENTAGE },
-          borders: {
-            top: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-            bottom: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-            left: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-            right: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-            insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: "000000" },
-            insideVertical: { style: BorderStyle.SINGLE, size: 1, color: "000000" }
-          }
+          width: hasGrid ? { size: totalGridWidth, type: widthTypeDxa } : { size: 100, type: WidthType.PERCENTAGE },
+          borders: tableBorders
         })
       )
       continue
@@ -411,6 +1825,7 @@ export async function createDocxFromParagraphs(paragraphs: DocxParagraph[]): Pro
     const paragraphOptions: any = {
       children: textRuns
     }
+    if (para.spacing) paragraphOptions.spacing = para.spacing
 
     if (para.headingLevel) {
       paragraphOptions.heading = HeadingLevel[`HEADING_${para.headingLevel}`]
@@ -422,16 +1837,54 @@ export async function createDocxFromParagraphs(paragraphs: DocxParagraph[]): Pro
           ? AlignmentType.CENTER
           : para.alignment === "right"
           ? AlignmentType.RIGHT
+          : para.alignment === "justify"
+          ? ((AlignmentType as any).JUSTIFIED ?? (AlignmentType as any).BOTH ?? AlignmentType.LEFT)
           : AlignmentType.LEFT
     }
 
     children.push(new Paragraph(paragraphOptions))
   }
 
+  let sectionSpec: SectionPropertiesSpec | undefined
+  for (const p of paragraphs) {
+    if (p.sectionProperties) sectionSpec = p.sectionProperties
+  }
+  const sectionProperties: any = {}
+  if (sectionSpec?.page?.size || sectionSpec?.page?.margin) {
+    const page: any = {}
+    if (sectionSpec.page?.size) {
+      const size: any = {}
+      if (typeof sectionSpec.page.size.width === "number") size.width = sectionSpec.page.size.width
+      if (typeof sectionSpec.page.size.height === "number") size.height = sectionSpec.page.size.height
+      if (sectionSpec.page.size.orientation === "landscape") size.orientation = PageOrientation.LANDSCAPE
+      if (sectionSpec.page.size.orientation === "portrait") size.orientation = PageOrientation.PORTRAIT
+      if (Object.keys(size).length) page.size = size
+    }
+    if (sectionSpec.page?.margin) {
+      const margin: any = {}
+      const m = sectionSpec.page.margin
+      if (typeof m.top === "number") margin.top = m.top
+      if (typeof m.right === "number") margin.right = m.right
+      if (typeof m.bottom === "number") margin.bottom = m.bottom
+      if (typeof m.left === "number") margin.left = m.left
+      if (typeof m.header === "number") margin.header = m.header
+      if (typeof m.footer === "number") margin.footer = m.footer
+      if (typeof m.gutter === "number") margin.gutter = m.gutter
+      if (Object.keys(margin).length) page.margin = margin
+    }
+    if (Object.keys(page).length) sectionProperties.page = page
+  }
+  if (sectionSpec?.column) {
+    const column: any = {}
+    if (typeof sectionSpec.column.count === "number") column.count = sectionSpec.column.count
+    if (typeof sectionSpec.column.space === "number") column.space = sectionSpec.column.space
+    if (Object.keys(column).length) sectionProperties.column = column
+  }
+
   const doc = new Document({
     sections: [
       {
-        properties: {},
+        properties: sectionProperties,
         children
       }
     ]
