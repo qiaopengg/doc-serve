@@ -102,14 +102,10 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     if (typeof res.flushHeaders === "function") res.flushHeaders()
 
     async function* generateDocxChunks(): AsyncGenerator<Buffer> {
-      // 计算总的流式单元数（段落 + 表格行）
+      // 计算总的流式单元数（段落 + 表格，每个表格算1个单元）
       let totalUnits = 0
       for (const para of allParagraphs) {
-        if (para.isTable && para.tableData) {
-          totalUnits += para.tableData.length
-        } else {
-          totalUnits += 1
-        }
+        totalUnits += 1
       }
       
       for (let i = 0; i < totalUnits; i += 1) {
@@ -166,14 +162,10 @@ export function registerDocRoutes(router: Router, deps: { docStore: DocStore }):
     if (typeof res.flushHeaders === "function") res.flushHeaders()
 
     async function* generateEnhancedDocxChunks(): AsyncGenerator<Buffer> {
-      // 计算总的流式单元数（段落 + 表格行）
+      // 计算总的流式单元数（段落 + 表格，每个表格算1个单元）
       let totalUnits = 0
       for (const para of allParagraphs) {
-        if (para.isTable && para.tableData) {
-          totalUnits += para.tableData.length
-        } else {
-          totalUnits += 1
-        }
+        totalUnits += 1
       }
       
       for (let i = 0; i < totalUnits; i += 1) {

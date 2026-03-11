@@ -15,29 +15,13 @@ import { readZipEntry, replaceZipEntry } from "./core/zip-reader.js"
 
 export function flattenParagraphsForStreaming(paragraphs: DocxParagraph[]): FlattenedElement[] {
   const flattened: FlattenedElement[] = []
-  let tableIndex = 0
   
   for (const para of paragraphs) {
-    if (para.isTable && para.tableData) {
-      const totalRows = para.tableData.length
-      for (let rowIndex = 0; rowIndex < totalRows; rowIndex++) {
-        flattened.push({
-          type: "table-row",
-          tableContext: {
-            tableIndex,
-            rowIndex,
-            totalRows,
-            tableParagraph: para
-          }
-        })
-      }
-      tableIndex++
-    } else {
-      flattened.push({
-        type: "paragraph",
-        paragraph: para
-      })
-    }
+    // 表格和段落都作为一个完整单元
+    flattened.push({
+      type: para.isTable ? "paragraph" : "paragraph",
+      paragraph: para
+    })
   }
   
   return flattened
@@ -86,35 +70,15 @@ export async function streamDocxSlices(
     const tn = tagNameOf(n)
     if (tn === "w:sectPr") continue
     
+    // 表格作为一个完整单元
     if (tn === "w:tbl") {
-      const tblPr = childOf(n, "w:tblPr")
-      const tblGrid = childOf(n, "w:tblGrid")
-      const allRows = childrenNamed(n, "w:tr")
-      
-      const remainingCount = bodyElementCount - included
-      const rowsToInclude = Math.min(remainingCount, allRows.length)
-      
-      if (rowsToInclude > 0) {
-        const partialTable = cloneNode(n)
-        const tableKey = "w:tbl"
-        const tableChildren: OrderedXmlNode[] = []
-        
-        if (tblPr) tableChildren.push(cloneNode(tblPr))
-        if (tblGrid) tableChildren.push(cloneNode(tblGrid))
-        
-        for (let r = 0; r < rowsToInclude; r++) {
-          tableChildren.push(cloneNode(allRows[r]!))
-        }
-        
-        partialTable[tableKey] = tableChildren
-        newBodyChildren.push(partialTable)
-        lastIncludedBodyIndex = i
-        included += rowsToInclude
-      }
-      
+      newBodyChildren.push(cloneNode(n))
+      lastIncludedBodyIndex = i
+      included += 1
       continue
     }
     
+    // 段落作为一个单元
     if (tn === "w:p") {
       newBodyChildren.push(cloneNode(n))
       lastIncludedBodyIndex = i
