@@ -1,14 +1,17 @@
 import type { Router } from "../http/router.js"
 import type { DocStore } from "../docStore/types.js"
-import { pipeDocxChunksToResponse } from "@wps/doc-core"
+import { HttpError, pipeDocxChunksToResponse } from "@wps/doc-core"
 import { URL } from "node:url"
 import { 
   streamDocxSlices,
   parseDocxDocument,
   getDocumentStatistics,
-  type SectionPropertiesSpec
+  type SectionPropertiesSpec,
+  type DocxDocument,
+  type DocxParseOptions
 } from "../docStore/docx/index.js"
 import type { Readable } from "node:stream"
+import type { IncomingMessage, ServerResponse } from "node:http"
 
 function randomIntInclusive(min: number, max: number): number {
   const a = Math.ceil(Math.min(min, max))
@@ -66,113 +69,136 @@ function sectionPropertiesToPageSetupPoints(section: SectionPropertiesSpec | und
   return Object.keys(out).length ? out : undefined
 }
 
-export function registerDocRoutes(router: Router, deps: { docStore: DocStore }): void {
-  async function readableToBuffer(stream: Readable): Promise<Buffer> {
-    const chunks: Buffer[] = []
-    for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
-    return Buffer.concat(chunks)
+type StreamRouteConfig = {
+  path: string
+  parseOptions: DocxParseOptions
+  includeStatsHeader: boolean
+}
+
+const DEFAULT_DOC_CANDIDATES = ["test.docx", "text.docx", "text.dock", "mock.docx"] as const
+
+async function readableToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = []
+  for await (const c of stream) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c))
+  return Buffer.concat(chunks)
+}
+
+function setCommonStreamHeaders(req: IncomingMessage, res: ServerResponse, delayMs: number): void {
+  res.statusCode = 200
+  res.setHeader("Content-Type", "application/x-wps-docx-chunks")
+  res.setHeader("X-Content-Type-Options", "nosniff")
+  res.setHeader("Cache-Control", "no-store")
+  res.setHeader("X-WPS-Stream-Mode", "docx-chunks")
+  res.setHeader("X-WPS-Delay-Ms", String(delayMs))
+  if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
+}
+
+function setPageSetupHeaders(res: ServerResponse, doc: DocxDocument): void {
+  const firstSection = doc.paragraphs.find((p) => p.sectionProperties)?.sectionProperties
+  const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
+  res.setHeader("X-WPS-PageSetup-Unit", "point")
+  res.setHeader("X-WPS-PageSetup-Source-Unit", "twip")
+  res.setHeader("X-WPS-PageSetup", encodeURIComponent(JSON.stringify(pageSetupPoints ?? {})))
+}
+
+function setStatsHeader(res: ServerResponse, doc: DocxDocument): void {
+  const stats = getDocumentStatistics(doc)
+  res.setHeader("X-WPS-Doc-Stats", encodeURIComponent(JSON.stringify({
+    paragraphCount: stats.paragraphCount,
+    tableCount: stats.tableCount,
+    imageCount: stats.imageCount,
+    wordCount: stats.wordCount,
+    hasNumbering: stats.hasNumbering,
+    hasComments: stats.hasComments,
+    hasHeaders: stats.hasHeaders,
+    hasFooters: stats.hasFooters
+  })))
+}
+
+async function streamDocxByConfig(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: { docStore: DocStore },
+  config: StreamRouteConfig
+): Promise<void> {
+  const delayMs = randomIntInclusive(100, 200)
+  setCommonStreamHeaders(req, res, delayMs)
+
+  const requestedDocId = getQueryParam(req, "docId")
+  const candidateDocIds = requestedDocId ? [requestedDocId] : [...DEFAULT_DOC_CANDIDATES]
+  let selectedFilename = ""
+  let selectedDocxBuffer: Buffer | undefined
+  let parsedDoc: DocxDocument | undefined
+  let lastErr: unknown
+
+  for (const candidateDocId of candidateDocIds) {
+    try {
+      const { meta, stream } = await deps.docStore.openStream(candidateDocId)
+      const docxBuffer = await readableToBuffer(stream)
+      const parsed = await parseDocxDocument(docxBuffer, config.parseOptions)
+      selectedFilename = meta.filename
+      selectedDocxBuffer = docxBuffer
+      parsedDoc = parsed
+      break
+    } catch (err) {
+      lastErr = err
+      if (requestedDocId) {
+        throw err
+      }
+      if (err instanceof HttpError && err.statusCode === 404) {
+        continue
+      }
+    }
   }
 
-  // 接口：按完整 docx 块流式推送（支持逐行流式输出表格）
-  router.add("GET", "/api/v1/docs/stream-docx", async ({ req, res }) => {
-    const delayMs = randomIntInclusive(100, 200)
-    
-    res.statusCode = 200
-    res.setHeader("Content-Type", "application/x-wps-docx-chunks")
-    res.setHeader("X-Content-Type-Options", "nosniff")
-    res.setHeader("Cache-Control", "no-store")
-    res.setHeader("X-WPS-Stream-Mode", "docx-chunks")
-    res.setHeader("X-WPS-Delay-Ms", String(delayMs))
-    
-    if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
-
-    const docId = getQueryParam(req, "docId") || "mock.docx"
-    const { stream } = await deps.docStore.openStream(docId)
-    const docxBuffer = await readableToBuffer(stream)
-    
-    const doc = await parseDocxDocument(docxBuffer, {})
-    const allParagraphs = doc.paragraphs
-
-    const firstSection = allParagraphs.find((p: any) => p.sectionProperties)?.sectionProperties
-    const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
-    res.setHeader("X-WPS-PageSetup-Unit", "point")
-    res.setHeader("X-WPS-PageSetup-Source-Unit", "twip")
-    res.setHeader("X-WPS-PageSetup", encodeURIComponent(JSON.stringify(pageSetupPoints ?? {})))
-
-    if (typeof res.flushHeaders === "function") res.flushHeaders()
-
-    async function* generateDocxChunks(): AsyncGenerator<Buffer> {
-      // 计算总的流式单元数（段落 + 表格，每个表格算1个单元）
-      let totalUnits = 0
-      for (const para of allParagraphs) {
-        totalUnits += 1
-      }
-      
-      for (let i = 0; i < totalUnits; i += 1) {
-        yield await streamDocxSlices(docxBuffer, i + 1)
-      }
+  if (!selectedDocxBuffer || !parsedDoc) {
+    if (lastErr instanceof HttpError && lastErr.statusCode === 404) {
+      throw lastErr
     }
+    throw new HttpError(404, "document_not_found")
+  }
 
-    await pipeDocxChunksToResponse(req, res, generateDocxChunks(), { delayMs })
-  })
+  const resolvedDocxBuffer = selectedDocxBuffer
+  const resolvedParsedDoc = parsedDoc
+  res.setHeader("X-WPS-Filename", selectedFilename)
+  setPageSetupHeaders(res, resolvedParsedDoc)
+  if (config.includeStatsHeader) {
+    setStatsHeader(res, resolvedParsedDoc)
+  }
 
-  // 接口：使用完整解析器的流式推送（返回格式与 stream-docx 一样，但支持逐行流式输出表格）
-  router.add("GET", "/api/v1/docs/better-stream-docx", async ({ req, res }) => {
-    const docId = getQueryParam(req, "docId") || "mock.docx"
-    const delayMs = randomIntInclusive(100, 200)
-    
-    res.statusCode = 200
-    res.setHeader("Content-Type", "application/x-wps-docx-chunks")
-    res.setHeader("X-Content-Type-Options", "nosniff")
-    res.setHeader("Cache-Control", "no-store")
-    res.setHeader("X-WPS-Stream-Mode", "docx-chunks")
-    res.setHeader("X-WPS-Delay-Ms", String(delayMs))
-    
-    if (typeof req.socket?.setNoDelay === "function") req.socket.setNoDelay(true)
+  if (typeof res.flushHeaders === "function") res.flushHeaders()
 
-    const { stream } = await deps.docStore.openStream(docId)
-    const docxBuffer = await readableToBuffer(stream)
-    
-    const fullDoc = await parseDocxDocument(docxBuffer, {
-      includeMetadata: true,
-      includeHeadersFooters: true,
-      includeComments: true,
-      includeNotes: true
+  async function* generateDocxChunks(): AsyncGenerator<Buffer> {
+    for (let i = 1; i <= resolvedParsedDoc.paragraphs.length; i += 1) {
+      yield await streamDocxSlices(resolvedDocxBuffer, i)
+    }
+  }
+
+  await pipeDocxChunksToResponse(req, res, generateDocxChunks(), { delayMs })
+}
+
+export function registerDocRoutes(router: Router, deps: { docStore: DocStore }): void {
+  const configs: StreamRouteConfig[] = [
+    {
+      path: "/api/v1/docs/stream-docx",
+      parseOptions: {},
+      includeStatsHeader: false
+    },
+    {
+      path: "/api/v1/docs/better-stream-docx",
+      parseOptions: {
+        includeMetadata: true,
+        includeHeadersFooters: true,
+        includeComments: true,
+        includeNotes: true
+      },
+      includeStatsHeader: true
+    }
+  ]
+
+  for (const config of configs) {
+    router.add("GET", config.path, async ({ req, res }) => {
+      await streamDocxByConfig(req, res, deps, config)
     })
-    const allParagraphs = fullDoc.paragraphs
-
-    const firstSection = allParagraphs.find((p: any) => p.sectionProperties)?.sectionProperties
-    const pageSetupPoints = sectionPropertiesToPageSetupPoints(firstSection)
-    
-    const stats = getDocumentStatistics(fullDoc)
-    res.setHeader("X-WPS-PageSetup-Unit", "point")
-    res.setHeader("X-WPS-PageSetup-Source-Unit", "twip")
-    res.setHeader("X-WPS-PageSetup", encodeURIComponent(JSON.stringify(pageSetupPoints ?? {})))
-    res.setHeader("X-WPS-Doc-Stats", encodeURIComponent(JSON.stringify({
-      paragraphCount: stats.paragraphCount,
-      tableCount: stats.tableCount,
-      imageCount: stats.imageCount,
-      wordCount: stats.wordCount,
-      hasNumbering: stats.hasNumbering,
-      hasComments: stats.hasComments,
-      hasHeaders: stats.hasHeaders,
-      hasFooters: stats.hasFooters
-    })))
-
-    if (typeof res.flushHeaders === "function") res.flushHeaders()
-
-    async function* generateEnhancedDocxChunks(): AsyncGenerator<Buffer> {
-      // 计算总的流式单元数（段落 + 表格，每个表格算1个单元）
-      let totalUnits = 0
-      for (const para of allParagraphs) {
-        totalUnits += 1
-      }
-      
-      for (let i = 0; i < totalUnits; i += 1) {
-        yield await streamDocxSlices(docxBuffer, i + 1)
-      }
-    }
-
-    await pipeDocxChunksToResponse(req, res, generateEnhancedDocxChunks(), { delayMs })
-  })
+  }
 }
